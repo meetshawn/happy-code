@@ -1889,7 +1889,6 @@ Use /help`, setHistory, onHistoryChange);
         const finishedDetail = `Result: ${step.preview ?? "(no output)"}`;
         const baseDetail = effectiveStatus === "running" ? runningDetail : finishedDetail;
         return /* @__PURE__ */ jsxs(Box, { flexDirection: "column", width: contentWidth, children: [
-          /* @__PURE__ */ jsx(Text, { color: "gray", children: flowSeparator }),
           /* @__PURE__ */ jsxs(Box, { paddingX: 1, flexDirection: "column", children: [
             /* @__PURE__ */ jsxs(Box, { children: [
               /* @__PURE__ */ jsx(Text, { color: statusColor, children: effectiveStatus === "running" ? "Running tool" : effectiveStatus === "done" ? "Tool completed" : effectiveStatus === "interrupted" ? "Tool interrupted" : "Tool failed" }),

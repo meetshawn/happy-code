@@ -1692,7 +1692,6 @@ export function App({
 
           return (
             <Box key={row.key} flexDirection="column" width={contentWidth}>
-              <Text color="gray">{flowSeparator}</Text>
               <Box paddingX={1} flexDirection="column">
                 <Box>
                   <Text color={statusColor}>
