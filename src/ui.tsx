@@ -505,6 +505,11 @@ export function App({
         if (value) {
           approveCommandForSession(value, process.cwd());
         }
+      } else if (answer.optionId === 'allow_global') {
+        const value = sessionPrefix || command;
+        if (value) {
+          allowGlobalCommandPrefix(value);
+        }
       }
     }
 
@@ -1764,11 +1769,11 @@ export function App({
 
       <Box marginTop={1} flexDirection="column" width={contentWidth}>
         <Box>
-          <Text color="green">{'>'}</Text>
+          <Text color="green">{'> '}</Text>
           <TextInput key={inputKey} value={input} onChange={setInput} onSubmit={submit} />
           {inlineParamPlaceholder ? <Text color="gray">{inlineParamPlaceholder}</Text> : null}
         </Box>
-        <Box>
+        <Box marginTop={1}>
           <Text color="gray">Mode: </Text>
           <Text color={modeDisplay.color}>{modeDisplay.label}</Text>
           <Text color="gray"> - {modeDisplay.hint} (Shift+Tab to cycle)</Text>
