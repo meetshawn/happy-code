@@ -78,16 +78,15 @@ program
       process.exit(1);
     }
 
-    if (options.new) {
-      createSession(typeof options.new === 'string' ? options.new : 'new', process.cwd());
-    }
-
     if (options.resume) {
       const restored = switchSession(String(options.resume), process.cwd());
       if (!restored) {
         process.stderr.write(`Session not found: ${options.resume}\n`);
         process.exit(1);
       }
+    } else {
+      const nextName = typeof options.new === 'string' ? options.new : 'new';
+      createSession(nextName, process.cwd());
     }
 
     const agent = new HappyCodeAgent(cfg);
@@ -132,7 +131,7 @@ program
   .command('chat')
   .description('Single-turn non-interactive chat')
   .requiredOption('-m, --message <text>', 'User message')
-  .option('--mode <mode>', `Mode: ${SUPPORTED_MODES.join('|')}`, 'ask')
+  .option('--mode <mode>', `Mode: ${SUPPORTED_MODES.join('|')}`, 'plan')
   .option('--model <name>', 'Override model')
   .option('--fallback-model <name>', 'Fallback model on failure')
   .option('--max-turns <n>', 'Max tool turns', '8')
@@ -152,7 +151,7 @@ program
       process.exit(1);
     }
 
-    const mode = (options.mode ?? 'ask') as AgentMode;
+    const mode = (options.mode ?? 'plan') as AgentMode;
     if (!SUPPORTED_MODES.includes(mode)) {
       process.stderr.write(`Invalid mode: ${mode}. Allowed: ${SUPPORTED_MODES.join(', ')}\n`);
       process.exit(1);
@@ -258,7 +257,7 @@ program
         },
         {
           name: 'reviewer',
-          mode: 'ask',
+          mode: 'plan',
           prompt: 'Review the proposed approach and list potential issues.'
         }
       ],

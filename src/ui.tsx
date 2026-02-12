@@ -18,6 +18,7 @@ import {
   loadSessionToolEvents,
   renameActiveSession,
   rewindActiveSession,
+  type SessionRecord,
   saveSessionMessages,
   saveSessionToolEvents,
   switchSession
@@ -62,6 +63,23 @@ type ToolStep = {
   preview?: string;
   endedAt?: number;
 };
+
+type UserQuestionOption = {
+  id: string;
+  label: string;
+  description?: string;
+};
+
+type UserQuestionPayload = {
+  title: string;
+  question: string;
+  types: string[];
+  options: UserQuestionOption[];
+  defaultType?: string;
+  defaultOptionId?: string;
+};
+
+type UserQuestionFocus = 'type' | 'option';
 
 type ThemeName = 'black-yellow' | 'cyber' | 'minimal';
 
@@ -116,14 +134,14 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/plan', complete: '/plan', desc: 'Generate implementation plan' },
   { cmd: '/test [command]', complete: '/test', desc: 'Run tests via tools' },
   { cmd: '/fix', complete: '/fix', desc: 'Investigate and fix issues' },
-  { cmd: '/mode ask|plan|edit|auto', complete: '/mode ', desc: 'Switch mode' },
+  { cmd: '/mode plan|edit|auto', complete: '/mode ', desc: 'Switch mode' },
   { cmd: '/theme', complete: '/theme ', desc: 'Get or set UI theme' },
   { cmd: '/model [name]', complete: '/model ', desc: 'Get or set model' },
   { cmd: '/permissions', complete: '/permissions', desc: 'Show tool permission config' },
   { cmd: '/permissions allow <tool>', complete: '/permissions allow ', desc: 'Allow specific tool' },
   { cmd: '/permissions deny <tool>', complete: '/permissions deny ', desc: 'Deny specific tool' },
   { cmd: '/permissions clear', complete: '/permissions clear', desc: 'Clear tool restrictions' },
-  { cmd: '/resume [sessionId]', complete: '/resume ', desc: 'Switch session' },
+  { cmd: '/resume [sessionId]', complete: '/resume ', desc: 'Open session picker (↑/↓ + Enter)' },
   { cmd: '/rewind <n>', complete: '/rewind ', desc: 'Drop last N messages' },
   { cmd: '/rename <name>', complete: '/rename ', desc: 'Rename current session' },
   { cmd: '/export [path]', complete: '/export ', desc: 'Export transcript' },
@@ -153,6 +171,7 @@ const COMMANDS: CommandDef[] = [
 ];
 
 const HELP_TEXT = COMMANDS.map((item) => `${item.cmd.padEnd(34, ' ')} ${item.desc}`).join('\n');
+const MODE_CYCLE: AgentMode[] = ['plan', 'edit', 'auto'];
 const MAX_RENDER_FLOW_ITEMS = 120;
 const MAX_TOOL_EVENTS_STORE = 2000;
 const MAX_PREVIEW_LINES = 5;
@@ -257,6 +276,10 @@ function getInlineParamPlaceholder(input: string): string {
   return getCommandParamHint(matched);
 }
 
+function countUserTurns(messages: ChatMessage[]): number {
+  return messages.filter((item) => item.role === 'user').length;
+}
+
 function pushAssistant(
   text: string,
   setHistory: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
@@ -315,6 +338,14 @@ export function App({
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [resumePickerOpen, setResumePickerOpen] = useState(false);
+  const [resumeCandidates, setResumeCandidates] = useState<SessionRecord[]>([]);
+  const [resumeCursor, setResumeCursor] = useState(0);
+  const [pendingUserQuestion, setPendingUserQuestion] = useState<UserQuestionPayload | null>(null);
+  const [questionFocus, setQuestionFocus] = useState<UserQuestionFocus>('option');
+  const [selectedTypeIndex, setSelectedTypeIndex] = useState(0);
+  const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
+  const pendingQuestionResolveRef = useRef<((answer: Record<string, unknown>) => void) | null>(null);
   const toolSeqRef = useRef(0);
   const toolTurnRef = useRef(0);
   const toolEventsHydratedRef = useRef(false);
@@ -325,6 +356,43 @@ export function App({
   const projectName = useMemo(() => path.basename(process.cwd()), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
   const flowSeparator = useMemo(() => '-'.repeat(contentWidth), [contentWidth]);
+
+  const shiftMode = useCallback(() => {
+    setRuntime((prev) => {
+      const currentIdx = MODE_CYCLE.indexOf(prev.mode);
+      const nextMode = MODE_CYCLE[(currentIdx + 1 + MODE_CYCLE.length) % MODE_CYCLE.length] ?? MODE_CYCLE[0];
+      pushAssistant(`Switched mode to: ${nextMode}`, setHistory, onHistoryChange);
+      return { ...prev, mode: nextMode };
+    });
+  }, [onHistoryChange]);
+
+  const closeUserQuestion = useCallback(() => {
+    setPendingUserQuestion(null);
+    setQuestionFocus('option');
+    setSelectedTypeIndex(0);
+    setSelectedOptionIndex(0);
+  }, []);
+
+  const confirmUserQuestion = useCallback(() => {
+    if (!pendingUserQuestion || !pendingQuestionResolveRef.current) {
+      return;
+    }
+
+    const type = pendingUserQuestion.types[selectedTypeIndex] ?? pendingUserQuestion.types[0] ?? 'single_choice';
+    const option = pendingUserQuestion.options[selectedOptionIndex] ?? pendingUserQuestion.options[0];
+    const answer = {
+      type,
+      optionId: option?.id ?? '',
+      optionLabel: option?.label ?? '',
+      question: pendingUserQuestion.question,
+      title: pendingUserQuestion.title
+    };
+
+    const resolver = pendingQuestionResolveRef.current;
+    pendingQuestionResolveRef.current = null;
+    closeUserQuestion();
+    resolver(answer);
+  }, [closeUserQuestion, pendingUserQuestion, selectedOptionIndex, selectedTypeIndex]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -348,7 +416,7 @@ export function App({
 
   useEffect(() => {
     const persisted = loadSessionToolEvents() as ToolTimelineEvent[];
-    const existingUserTurns = history.filter((item) => item.role === 'user').length;
+    const existingUserTurns = countUserTurns(history);
     const normalized = persisted.filter((item) => item.turn <= existingUserTurns);
     setToolEvents(normalized);
     if (normalized.length > 0) {
@@ -358,6 +426,14 @@ export function App({
       toolTurnRef.current = maxTurn;
     }
     toolEventsHydratedRef.current = true;
+  }, []);
+
+  useEffect(() => {
+    if (!toolEventsHydratedRef.current) {
+      return;
+    }
+    const existingUserTurns = countUserTurns(history);
+    setToolEvents((prev) => prev.filter((item) => item.turn <= existingUserTurns));
   }, [history]);
 
   useEffect(() => {
@@ -372,6 +448,40 @@ export function App({
     setInputKey((prev) => prev + 1);
   }, []);
 
+  const applySwitchedSession = useCallback(
+    (switched: SessionRecord) => {
+      setHistory(switched.messages);
+      const switchedEvents = (switched.toolEvents ?? []) as ToolTimelineEvent[];
+      setToolEvents(switchedEvents);
+      toolSeqRef.current = switchedEvents.reduce((max, item) => (item.seq > max ? item.seq : max), 0);
+      toolTurnRef.current = switchedEvents.reduce((max, item) => (item.turn > max ? item.turn : max), 0);
+      onHistoryChange?.(switched.messages);
+    },
+    [onHistoryChange]
+  );
+
+  const closeResumePicker = useCallback(() => {
+    setResumePickerOpen(false);
+    setResumeCandidates([]);
+    setResumeCursor(0);
+  }, []);
+
+  const confirmResumeSelection = useCallback(() => {
+    const selected = resumeCandidates[resumeCursor];
+    if (!selected) {
+      return;
+    }
+    const switched = switchSession(selected.id, process.cwd());
+    if (!switched) {
+      setError(`Session not found: ${selected.id}`);
+      closeResumePicker();
+      return;
+    }
+    applySwitchedSession(switched);
+    closeResumePicker();
+    pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
+  }, [applySwitchedSession, closeResumePicker, onHistoryChange, resumeCandidates, resumeCursor]);
+
   const inputSuggestions = useMemo(() => {
     const trimmed = input.trim();
     if (!trimmed.startsWith('/')) {
@@ -379,7 +489,7 @@ export function App({
     }
 
     const optionSuggestions = [
-      ...buildOptionSuggestions(input, '/mode ', ['ask', 'plan', 'edit', 'auto'], 'Select mode'),
+      ...buildOptionSuggestions(input, '/mode ', ['plan', 'edit', 'auto'], 'Select mode'),
       ...buildOptionSuggestions(input, '/theme ', ['black-yellow', 'cyber', 'minimal'], 'Select theme'),
       ...buildOptionSuggestions(
         input,
@@ -422,8 +532,78 @@ export function App({
   }, [inputSuggestions]);
 
   useInput((inputKey, key) => {
+    if (pendingUserQuestion) {
+      if (key.escape) {
+        closeUserQuestion();
+        setError(null);
+        return;
+      }
+
+      if (key.tab) {
+        setQuestionFocus((prev) => (prev === 'type' ? 'option' : 'type'));
+        return;
+      }
+
+      if (questionFocus === 'type' && pendingUserQuestion.types.length > 0) {
+        if (key.upArrow) {
+          setSelectedTypeIndex((prev) => (prev - 1 + pendingUserQuestion.types.length) % pendingUserQuestion.types.length);
+          return;
+        }
+        if (key.downArrow) {
+          setSelectedTypeIndex((prev) => (prev + 1) % pendingUserQuestion.types.length);
+          return;
+        }
+      }
+
+      if (questionFocus === 'option' && pendingUserQuestion.options.length > 0) {
+        if (key.upArrow) {
+          setSelectedOptionIndex((prev) => (prev - 1 + pendingUserQuestion.options.length) % pendingUserQuestion.options.length);
+          return;
+        }
+        if (key.downArrow) {
+          setSelectedOptionIndex((prev) => (prev + 1) % pendingUserQuestion.options.length);
+          return;
+        }
+      }
+
+      if (key.return) {
+        confirmUserQuestion();
+        return;
+      }
+
+      return;
+    }
+
+    if (resumePickerOpen) {
+      if (key.escape) {
+        closeResumePicker();
+        setError(null);
+        return;
+      }
+
+      if (resumeCandidates.length === 0) {
+        return;
+      }
+
+      if (key.upArrow) {
+        setResumeCursor((prev) => (prev - 1 + resumeCandidates.length) % resumeCandidates.length);
+        return;
+      }
+
+      if (key.downArrow) {
+        setResumeCursor((prev) => (prev + 1) % resumeCandidates.length);
+        return;
+      }
+    }
+
     if (key.escape) {
       setInputAtEnd('');
+      setError(null);
+      return;
+    }
+
+    if (key.tab && key.shift) {
+      shiftMode();
       setError(null);
       return;
     }
@@ -518,7 +698,40 @@ export function App({
             mcpTools,
             mcpCall: mcpManager
               ? (fullName, args) => mcpManager.callTool(fullName, args)
-              : undefined
+              : undefined,
+            onUserQuestion: (payload) =>
+              new Promise<Record<string, unknown>>((resolve) => {
+                const parsed = {
+                  title: typeof payload.title === 'string' ? payload.title : 'Need your decision',
+                  question: typeof payload.question === 'string' ? payload.question : 'Please choose an option.',
+                  types: Array.isArray(payload.types)
+                    ? payload.types.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                    : ['single_choice'],
+                  options: Array.isArray(payload.options)
+                    ? payload.options
+                        .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+                        .map((item, index) => ({
+                          id: typeof item.id === 'string' && item.id.trim() ? item.id : `option_${index + 1}`,
+                          label: typeof item.label === 'string' && item.label.trim() ? item.label : `Option ${index + 1}`,
+                          description: typeof item.description === 'string' ? item.description : ''
+                        }))
+                    : [
+                        { id: 'option_1', label: 'Proceed with default', description: 'Use default path.' },
+                        { id: 'option_2', label: 'Need clarification', description: 'Ask user for more detail.' }
+                      ],
+                  defaultType: typeof payload.defaultType === 'string' ? payload.defaultType : '',
+                  defaultOptionId: typeof payload.defaultOptionId === 'string' ? payload.defaultOptionId : ''
+                };
+
+                const typeIndex = Math.max(0, parsed.types.findIndex((item) => item === parsed.defaultType));
+                const optionIndex = Math.max(0, parsed.options.findIndex((item) => item.id === parsed.defaultOptionId));
+
+                setQuestionFocus('option');
+                setSelectedTypeIndex(typeIndex);
+                setSelectedOptionIndex(optionIndex);
+                setPendingUserQuestion(parsed);
+                pendingQuestionResolveRef.current = resolve;
+              })
           },
           (delta) => {
             streamingBufferRef.current += delta;
@@ -554,6 +767,8 @@ export function App({
         setStreaming('');
         streamingBufferRef.current = '';
       } catch (err) {
+        pendingQuestionResolveRef.current = null;
+        closeUserQuestion();
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         if (streamingFlushTimerRef.current) {
@@ -695,7 +910,7 @@ export function App({
       if (content === '/review') {
         void runAgentTask(
           'Please review the current repository changes. Use git_status and git_diff tools first, then provide: summary, potential bugs, security risks, and actionable fixes.',
-          'ask'
+          'plan'
         );
         return true;
       }
@@ -726,12 +941,12 @@ export function App({
       }
 
       if (content === '/tasks') {
-        void runAgentTask('List pending implementation tasks with priorities and next action.', 'ask');
+        void runAgentTask('List pending implementation tasks with priorities and next action.', 'plan');
         return true;
       }
 
       if (content === '/todos') {
-        void runAgentTask('Generate concise TODO checklist using markdown task items.', 'ask');
+        void runAgentTask('Generate concise TODO checklist using markdown task items.', 'plan');
         return true;
       }
 
@@ -841,7 +1056,7 @@ export function App({
               },
               {
                 name: 'reviewer',
-                mode: 'ask',
+                mode: 'plan',
                 prompt: 'Review the proposed approach and list potential issues.'
               }
             ],
@@ -921,10 +1136,16 @@ export function App({
       }
 
       if (content === '/resume') {
-        const sessions = listSessions(process.cwd())
-          .slice(0, 10)
-          .map((item) => `${item.id} ${item.name} (${item.updatedAt})`);
-        pushAssistant(sessions.length ? sessions.join('\n') : 'No sessions available.', setHistory, onHistoryChange);
+        const sessions = listSessions(process.cwd());
+        if (sessions.length === 0) {
+          pushAssistant('No sessions available.', setHistory, onHistoryChange);
+          return true;
+        }
+        setResumeCandidates(sessions);
+        setResumeCursor(0);
+        setResumePickerOpen(true);
+        setError(null);
+        setInput('');
         return true;
       }
 
@@ -935,12 +1156,8 @@ export function App({
           pushAssistant(`Session not found: ${id}`, setHistory, onHistoryChange);
           return true;
         }
-        setHistory(switched.messages);
-        const switchedEvents = (switched.toolEvents ?? []) as ToolTimelineEvent[];
-        setToolEvents(switchedEvents);
-        toolSeqRef.current = switchedEvents.reduce((max, item) => (item.seq > max ? item.seq : max), 0);
-        toolTurnRef.current = switchedEvents.reduce((max, item) => (item.turn > max ? item.turn : max), 0);
-        onHistoryChange?.(switched.messages);
+        applySwitchedSession(switched);
+        closeResumePicker();
         pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
         return true;
       }
@@ -949,6 +1166,7 @@ export function App({
         const n = Number.parseInt(content.replace('/rewind ', '').trim(), 10);
         const rewound = rewindActiveSession(Number.isFinite(n) ? n : 1, process.cwd());
         setHistory(rewound.messages);
+        setToolEvents((rewound.toolEvents ?? []) as ToolTimelineEvent[]);
         onHistoryChange?.(rewound.messages);
         pushAssistant(`Rewound session by ${Number.isFinite(n) ? n : 1} messages.`, setHistory, onHistoryChange);
         return true;
@@ -1022,6 +1240,8 @@ export function App({
     },
     [
       inputSuggestions,
+      applySwitchedSession,
+      closeResumePicker,
       enableAudit,
       history,
       onHistoryChange,
@@ -1031,6 +1251,16 @@ export function App({
   );
 
   const submit = useCallback(async () => {
+    if (pendingUserQuestion) {
+      confirmUserQuestion();
+      return;
+    }
+
+    if (resumePickerOpen) {
+      confirmResumeSelection();
+      return;
+    }
+
     const content = input.trim();
     if (!content || loading) {
       return;
@@ -1089,9 +1319,25 @@ export function App({
     loading,
     onHistoryChange,
     runAgentTask,
+    confirmResumeSelection,
+    confirmUserQuestion,
     setInputAtEnd,
-    suggestionIndex
+    suggestionIndex,
+    resumePickerOpen,
+    pendingUserQuestion
   ]);
+
+  const visibleResumeCandidates = useMemo(() => {
+    if (!resumePickerOpen) {
+      return [] as SessionRecord[];
+    }
+    const maxItems = 10;
+    if (resumeCandidates.length <= maxItems) {
+      return resumeCandidates;
+    }
+    const start = Math.max(0, Math.min(resumeCursor - Math.floor(maxItems / 2), resumeCandidates.length - maxItems));
+    return resumeCandidates.slice(start, start + maxItems);
+  }, [resumeCandidates, resumeCursor, resumePickerOpen]);
 
   const toolTimeline = useMemo(() => {
     return [...toolEvents].sort((a, b) => {
@@ -1215,6 +1461,8 @@ export function App({
       <Box borderStyle="round" borderColor={themeStyle.titleColor} paddingX={1} flexDirection="column" width={contentWidth}>
         <Text color={themeStyle.titleColor}>:) HappyCode</Text>
         <Text color={themeStyle.metaColor}>Project: {projectName}</Text>
+        <Text color={themeStyle.metaColor}>Mode: {runtime.mode}</Text>
+        {runtime.mode === 'plan' ? <Text color="yellow">PLAN MODE ACTIVE</Text> : null}
         <Text color={themeStyle.metaColor}>Model: {runtime.model ?? '(default)'}</Text>
         <Text color={themeStyle.metaColor}>Version: {appVersion}</Text>
       </Box>
@@ -1307,6 +1555,38 @@ export function App({
               {item.label} - {item.desc}
             </Text>
           ))}
+        </Box>
+      ) : null}
+
+      {pendingUserQuestion ? (
+        <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1} marginTop={1} width={contentWidth}>
+          <Text color="yellow">User Question Required</Text>
+          <Text>{pendingUserQuestion.title}</Text>
+          <Text color="gray">{pendingUserQuestion.question}</Text>
+          <Text color={questionFocus === 'type' ? 'cyan' : 'white'}>
+            Types: {pendingUserQuestion.types.map((item, idx) => (idx === selectedTypeIndex ? `[${item}]` : item)).join('  ')}
+          </Text>
+          {pendingUserQuestion.options.map((item, idx) => (
+            <Text key={item.id} color={questionFocus === 'option' && idx === selectedOptionIndex ? 'cyan' : 'white'}>
+              {idx === selectedOptionIndex ? '>' : ' '} {item.label}
+              {item.description ? ` - ${item.description}` : ''}
+            </Text>
+          ))}
+          <Text color="gray">Tab switch focus, ↑/↓ choose, Enter confirm</Text>
+        </Box>
+      ) : null}
+
+      {resumePickerOpen ? (
+        <Box marginTop={1} flexDirection="column" width={contentWidth}>
+          <Text color="white">Resume Sessions (↑/↓ choose, Enter confirm, Esc cancel)</Text>
+          {visibleResumeCandidates.map((item) => {
+            const selected = resumeCandidates[resumeCursor]?.id === item.id;
+            return (
+              <Text key={item.id} color={selected ? 'cyan' : 'white'}>
+                {selected ? '>' : ' '} {item.name} [{item.id}] {item.updatedAt} msgs:{item.messages.length}
+              </Text>
+            );
+          })}
         </Box>
       ) : null}
     </Box>
