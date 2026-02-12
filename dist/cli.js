@@ -465,7 +465,10 @@ function forkActiveSession(name, cwd = process.cwd()) {
 function rewindActiveSession(steps, cwd = process.cwd()) {
   const active = loadActiveSession(cwd);
   const drop = Math.max(1, steps);
-  active.messages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
+  const nextMessages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
+  const remainingUserTurns = nextMessages.filter((item) => item.role === "user").length;
+  active.messages = nextMessages;
+  active.toolEvents = active.toolEvents.filter((item) => item.turn <= remainingUserTurns);
   saveSessionRecord(active);
   return active;
 }
@@ -747,15 +750,17 @@ function App({
   );
   useEffect(() => {
     const persisted = loadSessionToolEvents();
-    setToolEvents(persisted);
-    if (persisted.length > 0) {
-      const maxSeq = persisted.reduce((max, item) => item.seq > max ? item.seq : max, 0);
-      const maxTurn = persisted.reduce((max, item) => item.turn > max ? item.turn : max, 0);
+    const existingUserTurns = history.filter((item) => item.role === "user").length;
+    const normalized = persisted.filter((item) => item.turn <= existingUserTurns);
+    setToolEvents(normalized);
+    if (normalized.length > 0) {
+      const maxSeq = normalized.reduce((max, item) => item.seq > max ? item.seq : max, 0);
+      const maxTurn = normalized.reduce((max, item) => item.turn > max ? item.turn : max, 0);
       toolSeqRef.current = maxSeq;
       toolTurnRef.current = maxTurn;
     }
     toolEventsHydratedRef.current = true;
-  }, []);
+  }, [history]);
   useEffect(() => {
     if (!toolEventsHydratedRef.current) {
       return;
@@ -1045,6 +1050,8 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       if (content === "/compact") {
         setHistory((prev) => {
           const compacted = prev.slice(-6);
+          const compactedUserTurns = compacted.filter((item) => item.role === "user").length;
+          setToolEvents((prevEvents) => prevEvents.filter((item) => item.turn <= compactedUserTurns));
           onHistoryChange?.(compacted);
           return compacted;
         });

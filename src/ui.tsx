@@ -348,15 +348,17 @@ export function App({
 
   useEffect(() => {
     const persisted = loadSessionToolEvents() as ToolTimelineEvent[];
-    setToolEvents(persisted);
-    if (persisted.length > 0) {
-      const maxSeq = persisted.reduce((max, item) => (item.seq > max ? item.seq : max), 0);
-      const maxTurn = persisted.reduce((max, item) => (item.turn > max ? item.turn : max), 0);
+    const existingUserTurns = history.filter((item) => item.role === 'user').length;
+    const normalized = persisted.filter((item) => item.turn <= existingUserTurns);
+    setToolEvents(normalized);
+    if (normalized.length > 0) {
+      const maxSeq = normalized.reduce((max, item) => (item.seq > max ? item.seq : max), 0);
+      const maxTurn = normalized.reduce((max, item) => (item.turn > max ? item.turn : max), 0);
       toolSeqRef.current = maxSeq;
       toolTurnRef.current = maxTurn;
     }
     toolEventsHydratedRef.current = true;
-  }, []);
+  }, [history]);
 
   useEffect(() => {
     if (!toolEventsHydratedRef.current) {
@@ -681,6 +683,8 @@ export function App({
       if (content === '/compact') {
         setHistory((prev) => {
           const compacted = prev.slice(-6);
+          const compactedUserTurns = compacted.filter((item) => item.role === 'user').length;
+          setToolEvents((prevEvents) => prevEvents.filter((item) => item.turn <= compactedUserTurns));
           onHistoryChange?.(compacted);
           return compacted;
         });

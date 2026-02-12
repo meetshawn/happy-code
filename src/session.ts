@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import type { ChatMessage } from './agent.js';
 
 export type SessionToolEvent = {
+  source: 'model' | 'runtime';
   phase: 'start' | 'end';
   name: string;
   args: Record<string, unknown>;
@@ -290,7 +291,10 @@ export function forkActiveSession(name?: string, cwd = process.cwd()): SessionRe
 export function rewindActiveSession(steps: number, cwd = process.cwd()): SessionRecord {
   const active = loadActiveSession(cwd);
   const drop = Math.max(1, steps);
-  active.messages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
+  const nextMessages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
+  const remainingUserTurns = nextMessages.filter((item) => item.role === 'user').length;
+  active.messages = nextMessages;
+  active.toolEvents = active.toolEvents.filter((item) => item.turn <= remainingUserTurns);
   saveSessionRecord(active);
   return active;
 }
