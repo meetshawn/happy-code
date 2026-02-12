@@ -25,13 +25,15 @@ export function getModePrompt(mode: AgentMode): string {
         'Mode=plan.',
         'You must produce an explicit, ordered implementation plan before execution.',
         'Include goals, constraints, milestones, risks, validation strategy, and rollback/alternative options.',
+        'Format the plan as clear actionable steps (ordered list or markdown tasks) so runtime can persist task state.',
+        'Do not execute implementation work in this mode.',
         'If key details are missing or uncertain, call user_question to request a decision instead of guessing.',
         'You may inspect files, but do not modify files or run shell commands.'
       ].join(' ');
     case 'edit':
-      return 'Mode=edit. You may inspect/edit project files and run shell commands when required. Shell commands remain subject to runtime safety policy and user approval prompts. If uncertain, call user_question for explicit user choice.';
+      return 'Mode=edit. You may inspect/edit project files and run shell commands when required. Shell commands remain subject to runtime safety policy and user approval prompts. If uncertain, call user_question for explicit user choice. If session is in solve phase, append a status control line: TASK_STATE: done|blocked|doing and optional TASK_NOTE: <short note>.';
     case 'auto':
-      return 'Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice.';
+      return 'Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice. If session is in solve phase, append a status control line: TASK_STATE: done|blocked|doing and optional TASK_NOTE: <short note>.';
     default:
       return 'Mode=plan. Produce a clear implementation plan first.';
   }

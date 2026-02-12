@@ -21,6 +21,7 @@ export type ToolRuntimeContext = {
   mode: AgentMode;
   cwd: string;
   enableAudit?: boolean;
+  abortSignal?: AbortSignal;
 };
 
 export type ToolCall =
@@ -69,6 +70,12 @@ function stringArg(args: JsonObject | undefined, key: string, fallback = ''): st
 function numberArg(args: JsonObject | undefined, key: string, fallback: number): number {
   const value = args?.[key];
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function assertNotAborted(context: ToolRuntimeContext): void {
+  if (context.abortSignal?.aborted) {
+    throw new Error('Interrupted by user.');
+  }
 }
 
 async function runCommand(cwd: string, command: string, timeoutMs = 30_000): Promise<string> {
@@ -265,6 +272,7 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
   const runtimePolicy = loadPolicy(context.cwd);
 
   try {
+    assertNotAborted(context);
     if (call.name === 'get_context') {
       const payload = JSON.stringify(
         {
@@ -296,20 +304,25 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
     let output = '';
     switch (call.name) {
       case 'list_files': {
+        assertNotAborted(context);
         const pattern = stringArg(call.args, 'pattern', '**/*');
         output = JSON.stringify(await listFiles(context.cwd, pattern), null, 2);
         break;
       }
       case 'read_file':
+        assertNotAborted(context);
         output = readFile(context.cwd, stringArg(call.args, 'path'));
         break;
       case 'write_file':
+        assertNotAborted(context);
         output = writeFile(context.cwd, stringArg(call.args, 'path'), stringArg(call.args, 'content'), context.mode);
         break;
       case 'append_file':
+        assertNotAborted(context);
         output = appendFile(context.cwd, stringArg(call.args, 'path'), stringArg(call.args, 'content'), context.mode);
         break;
       case 'patch_file':
+        assertNotAborted(context);
         output = patchFile(
           context.cwd,
           stringArg(call.args, 'path'),
@@ -319,9 +332,11 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
         );
         break;
       case 'delete_file':
+        assertNotAborted(context);
         output = deleteFile(context.cwd, stringArg(call.args, 'path'), context.mode);
         break;
       case 'search_in_files':
+        assertNotAborted(context);
         output = searchInFiles(
           context.cwd,
           stringArg(call.args, 'pattern'),
@@ -329,6 +344,7 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
         );
         break;
       case 'run_shell': {
+        assertNotAborted(context);
         const command = stringArg(call.args, 'command');
         if (context.mode !== 'auto') {
           const usedOneTimeApproval = consumeOneTimeApproval(command, context.cwd);
@@ -351,19 +367,23 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
             return output;
           }
         }
+        assertNotAborted(context);
         output = await runCommand(context.cwd, command, numberArg(call.args, 'timeout_ms', 30_000));
         break;
       }
       case 'git_status':
+        assertNotAborted(context);
         output = await runCommand(context.cwd, 'git status --short --branch');
         break;
       case 'git_diff': {
+        assertNotAborted(context);
         const target = stringArg(call.args, 'path', '').trim();
         const cmd = target ? `git diff -- ${target}` : 'git diff';
         output = await runCommand(context.cwd, cmd);
         break;
       }
       case 'git_log': {
+        assertNotAborted(context);
         const count = Math.max(1, Math.min(50, numberArg(call.args, 'count', 10)));
         output = await runCommand(context.cwd, `git log --oneline -n ${count}`);
         break;

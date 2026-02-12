@@ -2,6 +2,7 @@ type HappyCodeConfig = {
     baseUrl: string;
     apiKey: string;
     model: string;
+    maxTurns?: number;
 };
 declare function getConfigPath(): string;
 declare function readConfig(): HappyCodeConfig | null;
@@ -42,6 +43,7 @@ type AgentOptions = {
     mcpTools?: McpToolDescriptor[];
     mcpCall?: (fullName: string, args: Record<string, unknown>) => Promise<string>;
     onUserQuestion?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    abortSignal?: AbortSignal;
 };
 type ToolEvent = {
     source: 'model' | 'runtime';

@@ -24,6 +24,7 @@ export type AgentOptions = {
   mcpTools?: McpToolDescriptor[];
   mcpCall?: (fullName: string, args: Record<string, unknown>) => Promise<string>;
   onUserQuestion?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  abortSignal?: AbortSignal;
 };
 
 export type ToolEvent = {
@@ -123,6 +124,11 @@ export class HappyCodeAgent {
     onDelta?: (chunk: string) => void,
     onToolEvent?: (event: ToolEvent) => void
   ): Promise<string> {
+    const wasAborted = () => options.abortSignal?.aborted === true;
+    if (wasAborted()) {
+      return 'Interrupted by user.';
+    }
+
     const maxTurns = options.maxTurns ?? 24;
     const running = toOpenAIMessages(
       messages,
@@ -142,26 +148,38 @@ export class HappyCodeAgent {
       completionMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
     ) => {
       try {
-        return await this.client.chat.completions.create({
-          model,
-          messages: completionMessages,
-          tools: tools as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
-          tool_choice: 'auto'
-        });
+        return await this.client.chat.completions.create(
+          {
+            model,
+            messages: completionMessages,
+            tools: tools as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
+            tool_choice: 'auto'
+          },
+          options.abortSignal ? ({ signal: options.abortSignal } as unknown as OpenAI.RequestOptions) : undefined
+        );
       } catch (err) {
+        if (wasAborted()) {
+          throw new Error('Interrupted by user.');
+        }
         if (!fallbackModel) {
           throw err;
         }
-        return await this.client.chat.completions.create({
-          model: fallbackModel,
-          messages: completionMessages,
-          tools: tools as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
-          tool_choice: 'auto'
-        });
+        return await this.client.chat.completions.create(
+          {
+            model: fallbackModel,
+            messages: completionMessages,
+            tools: tools as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
+            tool_choice: 'auto'
+          },
+          options.abortSignal ? ({ signal: options.abortSignal } as unknown as OpenAI.RequestOptions) : undefined
+        );
       }
     };
 
     for (let turn = 0; turn < maxTurns; turn += 1) {
+      if (wasAborted()) {
+        return 'Interrupted by user.';
+      }
       const completion = await createCompletion(running);
 
       const message = completion.choices[0]?.message;
@@ -182,6 +200,9 @@ export class HappyCodeAgent {
       });
 
       for (const toolCall of message.tool_calls) {
+        if (wasAborted()) {
+          return 'Interrupted by user.';
+        }
         if (toolCall.type !== 'function') {
           continue;
         }
@@ -216,9 +237,14 @@ export class HappyCodeAgent {
             {
               mode: options.mode,
               cwd: options.cwd,
-              enableAudit: options.enableAudit ?? true
+              enableAudit: options.enableAudit ?? true,
+              abortSignal: options.abortSignal
             }
           );
+        }
+
+        if (wasAborted()) {
+          return 'Interrupted by user.';
         }
 
         let questionPayload: Record<string, unknown> | undefined;
@@ -249,7 +275,8 @@ export class HappyCodeAgent {
                     {
                       mode: options.mode,
                       cwd: options.cwd,
-                      enableAudit: options.enableAudit ?? true
+                      enableAudit: options.enableAudit ?? true,
+                      abortSignal: options.abortSignal
                     }
                   );
                 } else {

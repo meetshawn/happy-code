@@ -27,6 +27,16 @@ export type SessionRecord = {
   oneTimeApprovedCommands?: string[];
   projectKey?: string;
   projectRoot?: string;
+  activePlanId?: string;
+  activeTaskSetId?: string;
+  planSolvePhase?: 'planning' | 'solving' | 'completed' | 'paused';
+  inputHistory?: InputHistoryEntry[];
+};
+
+export type InputHistoryEntry = {
+  id: string;
+  text: string;
+  createdAt: string;
 };
 
 const SESSION_ROOT = path.join(os.homedir(), '.happycode', 'sessions');
@@ -70,7 +80,9 @@ function normalizeRecord(record: SessionRecord): SessionRecord {
     sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes)
       ? record.sessionApprovedCommandPrefixes
       : [],
-    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : []
+    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
+    planSolvePhase: record.planSolvePhase ?? 'planning',
+    inputHistory: normalizeInputHistory(record.inputHistory)
   };
 }
 
@@ -109,6 +121,43 @@ function randomId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function normalizeInputHistory(entries: unknown): InputHistoryEntry[] {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  const now = nowIso();
+  const normalized: InputHistoryEntry[] = [];
+  for (const item of entries) {
+    if (typeof item === 'string') {
+      const text = item.trim();
+      if (text) {
+        normalized.push({
+          id: randomId(),
+          text,
+          createdAt: now
+        });
+      }
+      continue;
+    }
+    if (!item || typeof item !== 'object') {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const text = typeof candidate.text === 'string' ? candidate.text.trim() : '';
+    if (!text) {
+      continue;
+    }
+    normalized.push({
+      id: typeof candidate.id === 'string' && candidate.id.trim() ? candidate.id : randomId(),
+      text,
+      createdAt: typeof candidate.createdAt === 'string' && candidate.createdAt.trim() ? candidate.createdAt : now
+    });
+  }
+
+  return normalized.slice(-100);
+}
+
 export function getSessionRootPath(): string {
   ensureDir();
   return SESSION_ROOT;
@@ -132,7 +181,9 @@ export function createSession(name = 'default', cwd = process.cwd()): SessionRec
     sessionApprovedCommandPrefixes: [],
     oneTimeApprovedCommands: [],
     projectKey: meta.projectKey,
-    projectRoot: meta.projectRoot
+    projectRoot: meta.projectRoot,
+    planSolvePhase: 'planning',
+    inputHistory: []
   };
   saveSessionRecord(record);
   setActiveSessionId(id, cwd);
@@ -149,6 +200,8 @@ export function saveSessionRecord(record: SessionRecord): void {
       ? record.sessionApprovedCommandPrefixes
       : [],
     oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
+    planSolvePhase: record.planSolvePhase ?? 'planning',
+    inputHistory: normalizeInputHistory(record.inputHistory),
     updatedAt: nowIso()
   };
   fs.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}\n`, 'utf8');
@@ -276,6 +329,75 @@ export function clearSession(cwd = process.cwd()): void {
   saveSessionRecord(active);
 }
 
+export function getInputHistory(cwd = process.cwd()): InputHistoryEntry[] {
+  const active = loadActiveSession(cwd);
+  return active.inputHistory ?? [];
+}
+
+export function appendInputHistoryEntry(entry: string, cwd = process.cwd()): InputHistoryEntry[] {
+  const normalized = entry.trim();
+  if (!normalized) {
+    return getInputHistory(cwd);
+  }
+  const active = loadActiveSession(cwd);
+  const history = active.inputHistory ?? [];
+  if (history[history.length - 1]?.text === normalized) {
+    return history;
+  }
+  const next: InputHistoryEntry[] = [
+    ...history,
+    {
+      id: randomId(),
+      text: normalized,
+      createdAt: nowIso()
+    }
+  ].slice(-100);
+  active.inputHistory = next;
+  saveSessionRecord(active);
+  return next;
+}
+
+export function appendInputHistory(entry: string, cwd = process.cwd()): string[] {
+  return appendInputHistoryEntry(entry, cwd).map((item) => item.text);
+}
+
+export function getInputHistoryTexts(cwd = process.cwd()): string[] {
+  return getInputHistory(cwd).map((item) => item.text);
+}
+
+export function bindPlanToActiveSession(
+  planId: string,
+  taskSetId: string,
+  phase: 'planning' | 'solving' | 'completed' | 'paused' = 'planning',
+  cwd = process.cwd()
+): SessionRecord {
+  const active = loadActiveSession(cwd);
+  active.activePlanId = planId;
+  active.activeTaskSetId = taskSetId;
+  active.planSolvePhase = phase;
+  saveSessionRecord(active);
+  return active;
+}
+
+export function setActiveSessionPlanPhase(
+  phase: 'planning' | 'solving' | 'completed' | 'paused',
+  cwd = process.cwd()
+): SessionRecord {
+  const active = loadActiveSession(cwd);
+  active.planSolvePhase = phase;
+  saveSessionRecord(active);
+  return active;
+}
+
+export function clearActiveSessionPlanBinding(cwd = process.cwd()): SessionRecord {
+  const active = loadActiveSession(cwd);
+  delete active.activePlanId;
+  delete active.activeTaskSetId;
+  active.planSolvePhase = 'planning';
+  saveSessionRecord(active);
+  return active;
+}
+
 export function renameActiveSession(name: string, cwd = process.cwd()): SessionRecord {
   const active = loadActiveSession(cwd);
   active.name = safeName(name);
@@ -295,7 +417,11 @@ export function forkActiveSession(name?: string, cwd = process.cwd()): SessionRe
     sessionApprovedCommandPrefixes: [...(active.sessionApprovedCommandPrefixes ?? [])],
     oneTimeApprovedCommands: [],
     projectKey: active.projectKey,
-    projectRoot: active.projectRoot
+    projectRoot: active.projectRoot,
+    activePlanId: active.activePlanId,
+    activeTaskSetId: active.activeTaskSetId,
+    planSolvePhase: active.planSolvePhase ?? 'planning',
+    inputHistory: [...(active.inputHistory ?? [])]
   };
   saveSessionRecord(clone);
   setActiveSessionId(clone.id, cwd);

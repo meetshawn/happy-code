@@ -1,0 +1,12 @@
+{
+  "user": {
+    "title": "主人",
+    "preferences": {
+      "greeting": "主人"
+    },
+    "facts": [],
+    "notes": [],
+    "constraints": [],
+    "updated_at": "2025-06-20"
+  }
+}

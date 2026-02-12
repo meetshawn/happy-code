@@ -18,13 +18,15 @@ function getModePrompt(mode) {
         "Mode=plan.",
         "You must produce an explicit, ordered implementation plan before execution.",
         "Include goals, constraints, milestones, risks, validation strategy, and rollback/alternative options.",
+        "Format the plan as clear actionable steps (ordered list or markdown tasks) so runtime can persist task state.",
+        "Do not execute implementation work in this mode.",
         "If key details are missing or uncertain, call user_question to request a decision instead of guessing.",
         "You may inspect files, but do not modify files or run shell commands."
       ].join(" ");
     case "edit":
-      return "Mode=edit. You may inspect/edit project files and run shell commands when required. Shell commands remain subject to runtime safety policy and user approval prompts. If uncertain, call user_question for explicit user choice.";
+      return "Mode=edit. You may inspect/edit project files and run shell commands when required. Shell commands remain subject to runtime safety policy and user approval prompts. If uncertain, call user_question for explicit user choice. If session is in solve phase, append a status control line: TASK_STATE: done|blocked|doing and optional TASK_NOTE: <short note>.";
     case "auto":
-      return "Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice.";
+      return "Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice. If session is in solve phase, append a status control line: TASK_STATE: done|blocked|doing and optional TASK_NOTE: <short note>.";
     default:
       return "Mode=plan. Produce a clear implementation plan first.";
   }
@@ -279,7 +281,9 @@ function normalizeRecord(record) {
     ...record,
     toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
     sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes) ? record.sessionApprovedCommandPrefixes : [],
-    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : []
+    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
+    planSolvePhase: record.planSolvePhase ?? "planning",
+    inputHistory: normalizeInputHistory(record.inputHistory)
   };
 }
 function readActiveMap() {
@@ -312,6 +316,40 @@ function nowIso() {
 function randomId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
+function normalizeInputHistory(entries) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  const now = nowIso();
+  const normalized = [];
+  for (const item of entries) {
+    if (typeof item === "string") {
+      const text2 = item.trim();
+      if (text2) {
+        normalized.push({
+          id: randomId(),
+          text: text2,
+          createdAt: now
+        });
+      }
+      continue;
+    }
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const candidate = item;
+    const text = typeof candidate.text === "string" ? candidate.text.trim() : "";
+    if (!text) {
+      continue;
+    }
+    normalized.push({
+      id: typeof candidate.id === "string" && candidate.id.trim() ? candidate.id : randomId(),
+      text,
+      createdAt: typeof candidate.createdAt === "string" && candidate.createdAt.trim() ? candidate.createdAt : now
+    });
+  }
+  return normalized.slice(-100);
+}
 function getSessionRootPath() {
   ensureDir3();
   return SESSION_ROOT;
@@ -333,7 +371,9 @@ function createSession(name = "default", cwd = process.cwd()) {
     sessionApprovedCommandPrefixes: [],
     oneTimeApprovedCommands: [],
     projectKey: meta.projectKey,
-    projectRoot: meta.projectRoot
+    projectRoot: meta.projectRoot,
+    planSolvePhase: "planning",
+    inputHistory: []
   };
   saveSessionRecord(record);
   setActiveSessionId(id, cwd);
@@ -347,6 +387,8 @@ function saveSessionRecord(record) {
     toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
     sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes) ? record.sessionApprovedCommandPrefixes : [],
     oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
+    planSolvePhase: record.planSolvePhase ?? "planning",
+    inputHistory: normalizeInputHistory(record.inputHistory),
     updatedAt: nowIso()
   };
   fs4.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}
@@ -458,6 +500,54 @@ function clearSession(cwd = process.cwd()) {
   active.toolEvents = [];
   saveSessionRecord(active);
 }
+function getInputHistory(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  return active.inputHistory ?? [];
+}
+function appendInputHistoryEntry(entry, cwd = process.cwd()) {
+  const normalized = entry.trim();
+  if (!normalized) {
+    return getInputHistory(cwd);
+  }
+  const active = loadActiveSession(cwd);
+  const history = active.inputHistory ?? [];
+  if (history[history.length - 1]?.text === normalized) {
+    return history;
+  }
+  const next = [
+    ...history,
+    {
+      id: randomId(),
+      text: normalized,
+      createdAt: nowIso()
+    }
+  ].slice(-100);
+  active.inputHistory = next;
+  saveSessionRecord(active);
+  return next;
+}
+function bindPlanToActiveSession(planId, taskSetId, phase = "planning", cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.activePlanId = planId;
+  active.activeTaskSetId = taskSetId;
+  active.planSolvePhase = phase;
+  saveSessionRecord(active);
+  return active;
+}
+function setActiveSessionPlanPhase(phase, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.planSolvePhase = phase;
+  saveSessionRecord(active);
+  return active;
+}
+function clearActiveSessionPlanBinding(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  delete active.activePlanId;
+  delete active.activeTaskSetId;
+  active.planSolvePhase = "planning";
+  saveSessionRecord(active);
+  return active;
+}
 function renameActiveSession(name, cwd = process.cwd()) {
   const active = loadActiveSession(cwd);
   active.name = safeName(name);
@@ -476,7 +566,11 @@ function forkActiveSession(name, cwd = process.cwd()) {
     sessionApprovedCommandPrefixes: [...active.sessionApprovedCommandPrefixes ?? []],
     oneTimeApprovedCommands: [],
     projectKey: active.projectKey,
-    projectRoot: active.projectRoot
+    projectRoot: active.projectRoot,
+    activePlanId: active.activePlanId,
+    activeTaskSetId: active.activeTaskSetId,
+    planSolvePhase: active.planSolvePhase ?? "planning",
+    inputHistory: [...active.inputHistory ?? []]
   };
   saveSessionRecord(clone);
   setActiveSessionId(clone.id, cwd);
@@ -567,10 +661,275 @@ function clearSessionApprovals(cwd = process.cwd()) {
 // src/agent.ts
 import OpenAI from "openai";
 
-// src/tools.ts
+// src/memory.ts
 import fs5 from "fs";
+import os5 from "os";
 import path5 from "path";
 import { exec } from "child_process";
+var GLOBAL_MEMORY_PATH = path5.join(os5.homedir(), ".happycode", "memory_user.md");
+var LEGACY_MEMORY_PATH = path5.join(os5.homedir(), ".happycode", "memory.md");
+var PROJECT_MEMORY_DIR = ".happycode";
+var PROJECT_MEMORY_FILE = "memory_project.md";
+var LEGACY_PROJECT_MEMORY_FILE = ".happycode-memory.md";
+var MEMORY_PROMPT_MAX_CHARS = 2400;
+var SECTION_LABELS = {
+  facts: "Facts",
+  preferences: "Preferences",
+  constraints: "Constraints",
+  notes: "Notes"
+};
+var SECTION_PRIORITY = ["constraints", "preferences", "facts", "notes"];
+function normalizeLine(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function emptyDocument(scope) {
+  return {
+    scope,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    facts: [],
+    preferences: [],
+    constraints: [],
+    notes: []
+  };
+}
+function parseSectionLabel(raw) {
+  const normalized = normalizeLine(raw).toLowerCase();
+  if (normalized === "facts") {
+    return "facts";
+  }
+  if (normalized === "preferences") {
+    return "preferences";
+  }
+  if (normalized === "constraints") {
+    return "constraints";
+  }
+  if (normalized === "notes") {
+    return "notes";
+  }
+  return null;
+}
+function parseMemoryMarkdown(content, scope) {
+  const doc = emptyDocument(scope);
+  let activeSection = null;
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed.startsWith("# ")) {
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      activeSection = parseSectionLabel(trimmed.slice(3));
+      continue;
+    }
+    if (trimmed.startsWith("- updatedAt:")) {
+      const raw = normalizeLine(trimmed.slice("- updatedAt:".length));
+      if (raw) {
+        doc.updatedAt = raw;
+      }
+      continue;
+    }
+    if (!activeSection) {
+      continue;
+    }
+    const value = trimmed.startsWith("- ") ? normalizeLine(trimmed.slice(2)) : normalizeLine(trimmed);
+    if (!value) {
+      continue;
+    }
+    doc[activeSection].push(value);
+  }
+  return doc;
+}
+function toMemoryMarkdown(doc) {
+  const lines = [
+    "# HappyCode Memory",
+    "## Meta",
+    `- scope: ${doc.scope}`,
+    `- updatedAt: ${doc.updatedAt}`
+  ];
+  for (const section of SECTION_PRIORITY) {
+    lines.push(`## ${SECTION_LABELS[section]}`);
+    const entries = doc[section];
+    if (entries.length === 0) {
+      lines.push("- (empty)");
+      continue;
+    }
+    for (const item of entries) {
+      lines.push(`- ${item}`);
+    }
+  }
+  return `${lines.join("\n")}
+`;
+}
+function defaultMemoryMarkdown(scope) {
+  return toMemoryMarkdown(emptyDocument(scope));
+}
+function ensureParentDir(filePath) {
+  fs5.mkdirSync(path5.dirname(filePath), { recursive: true });
+}
+function scopePath(scope, cwd = process.cwd()) {
+  if (scope === "user") {
+    return GLOBAL_MEMORY_PATH;
+  }
+  return path5.join(cwd, PROJECT_MEMORY_DIR, PROJECT_MEMORY_FILE);
+}
+function legacyProjectScopePath(cwd = process.cwd()) {
+  return path5.join(cwd, LEGACY_PROJECT_MEMORY_FILE);
+}
+function migrateLegacyProjectMemoryIfNeeded(cwd = process.cwd()) {
+  const currentPath = scopePath("project", cwd);
+  const legacyPath = legacyProjectScopePath(cwd);
+  if (fs5.existsSync(currentPath) || !fs5.existsSync(legacyPath)) {
+    return;
+  }
+  const legacyRaw = fs5.readFileSync(legacyPath, "utf8");
+  const migratedDoc = parseMemoryMarkdown(legacyRaw, "project");
+  writeMemoryDocument("project", migratedDoc, cwd);
+}
+function enforceUniqueSection(items) {
+  const seen = /* @__PURE__ */ new Set();
+  const deduped = [];
+  for (const item of items) {
+    const normalized = normalizeLine(item);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    deduped.push(normalized);
+  }
+  return deduped;
+}
+function truncateBlock(lines, limit) {
+  const buffer = [];
+  for (const line of lines) {
+    const next = buffer.length === 0 ? line : `${buffer.join("\n")}
+${line}`;
+    if (next.length > limit) {
+      if (buffer.length === 0) {
+        return `${line.slice(0, Math.max(0, limit - 3))}...`;
+      }
+      return `${buffer.join("\n")}
+...`;
+    }
+    buffer.push(line);
+  }
+  return buffer.join("\n");
+}
+function buildScopePrompt(title, doc, limit) {
+  const lines = [title];
+  for (const section of SECTION_PRIORITY) {
+    const entries = doc[section];
+    if (entries.length === 0) {
+      continue;
+    }
+    lines.push(`${SECTION_LABELS[section]}:`);
+    for (const entry of entries) {
+      lines.push(`- ${entry}`);
+    }
+  }
+  if (lines.length === 1) {
+    lines.push("- (empty)");
+  }
+  return truncateBlock(lines, limit);
+}
+function getMemoryPath() {
+  return GLOBAL_MEMORY_PATH;
+}
+function getProjectMemoryPath(cwd = process.cwd()) {
+  return scopePath("project", cwd);
+}
+function readMemoryDocument(scope = "user", cwd = process.cwd()) {
+  if (scope === "project") {
+    migrateLegacyProjectMemoryIfNeeded(cwd);
+  }
+  const target = scopePath(scope, cwd);
+  if (!fs5.existsSync(target)) {
+    if (scope === "user" && fs5.existsSync(LEGACY_MEMORY_PATH)) {
+      const legacy = fs5.readFileSync(LEGACY_MEMORY_PATH, "utf8");
+      const migrated = parseMemoryMarkdown(legacy, scope);
+      writeMemoryDocument(scope, migrated, cwd);
+      return migrated;
+    }
+    return emptyDocument(scope);
+  }
+  const raw = fs5.readFileSync(target, "utf8");
+  return parseMemoryMarkdown(raw, scope);
+}
+function writeMemoryDocument(scope, doc, cwd = process.cwd()) {
+  const target = scopePath(scope, cwd);
+  ensureParentDir(target);
+  const normalized = {
+    ...doc,
+    scope,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    facts: enforceUniqueSection(doc.facts),
+    preferences: enforceUniqueSection(doc.preferences),
+    constraints: enforceUniqueSection(doc.constraints),
+    notes: enforceUniqueSection(doc.notes)
+  };
+  fs5.writeFileSync(target, toMemoryMarkdown(normalized), "utf8");
+}
+function ensureMemoryFile(scope, cwd = process.cwd()) {
+  if (scope === "project") {
+    migrateLegacyProjectMemoryIfNeeded(cwd);
+  }
+  const target = scopePath(scope, cwd);
+  if (!fs5.existsSync(target)) {
+    ensureParentDir(target);
+    fs5.writeFileSync(target, defaultMemoryMarkdown(scope), "utf8");
+  }
+  return target;
+}
+async function openMemoryFile(scope, cwd = process.cwd()) {
+  const target = ensureMemoryFile(scope, cwd);
+  const escaped = target.replace(/"/g, '\\"');
+  const command = process.platform === "win32" ? `start "" "${escaped}"` : process.platform === "darwin" ? `open "${escaped}"` : `xdg-open "${escaped}"`;
+  return new Promise((resolve) => {
+    exec(command, (error) => {
+      if (error) {
+        resolve({
+          ok: false,
+          path: target,
+          message: `Failed to open memory file automatically: ${error.message}`
+        });
+        return;
+      }
+      resolve({
+        ok: true,
+        path: target,
+        message: `Opened ${scope} memory file.`
+      });
+    });
+  });
+}
+function buildRuntimeMemoryPrompt(cwd = process.cwd(), maxChars = MEMORY_PROMPT_MAX_CHARS) {
+  const userDoc = readMemoryDocument("user", cwd);
+  const projectDoc = readMemoryDocument("project", cwd);
+  const perScope = Math.max(200, Math.floor(maxChars / 2));
+  const userBlock = buildScopePrompt("User Memory:", userDoc, perScope);
+  const projectBlock = buildScopePrompt("Project Memory:", projectDoc, perScope);
+  const merged = [
+    "[Persistent Memory]",
+    userBlock,
+    "",
+    projectBlock,
+    "",
+    "Use memory as soft constraints. If explicit user request conflicts in this turn, follow current request."
+  ].join("\n").trim();
+  if (merged === "[Persistent Memory]") {
+    return "";
+  }
+  if (merged.length <= maxChars) {
+    return merged;
+  }
+  return `${merged.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+// src/tools.ts
+import fs6 from "fs";
+import path6 from "path";
+import { exec as exec2 } from "child_process";
 import { promisify } from "util";
 import fg from "fast-glob";
 
@@ -599,21 +958,21 @@ function validateShellCommand(command, policy) {
 }
 
 // src/tools.ts
-var execAsync = promisify(exec);
+var execAsync = promisify(exec2);
 var MAX_READ = 3e4;
 var MAX_OUTPUT = 2e4;
 var USER_QUESTION_PREFIX = "NEEDS_USER_QUESTION::";
 var APPROVAL_REQUIRED_PREFIX = "NEEDS_APPROVAL::";
 function resolveInCwd(cwd, inputPath) {
-  const resolved = path5.resolve(cwd, inputPath);
-  const normalizedCwd = path5.resolve(cwd) + path5.sep;
-  if (resolved !== path5.resolve(cwd) && !resolved.startsWith(normalizedCwd)) {
+  const resolved = path6.resolve(cwd, inputPath);
+  const normalizedCwd = path6.resolve(cwd) + path6.sep;
+  if (resolved !== path6.resolve(cwd) && !resolved.startsWith(normalizedCwd)) {
     throw new Error("Path escapes current workspace.");
   }
   return resolved;
 }
 function toRelative(cwd, fullPath) {
-  return path5.relative(cwd, fullPath).replace(/\\/g, "/");
+  return path6.relative(cwd, fullPath).replace(/\\/g, "/");
 }
 function clampOutput(text, limit = MAX_OUTPUT) {
   if (text.length <= limit) {
@@ -630,6 +989,11 @@ function stringArg(args, key, fallback = "") {
 function numberArg(args, key, fallback) {
   const value = args?.[key];
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function assertNotAborted(context) {
+  if (context.abortSignal?.aborted) {
+    throw new Error("Interrupted by user.");
+  }
 }
 async function runCommand(cwd, command, timeoutMs = 3e4) {
   const { stdout, stderr } = await execAsync(command, {
@@ -651,7 +1015,7 @@ async function listFiles(cwd, pattern = "**/*") {
 }
 function readFile(cwd, filePath) {
   const fullPath = resolveInCwd(cwd, filePath);
-  const content = fs5.readFileSync(fullPath, "utf8");
+  const content = fs6.readFileSync(fullPath, "utf8");
   return clampOutput(content, MAX_READ);
 }
 function assertWritable(cwd, filePath, mode) {
@@ -668,35 +1032,35 @@ function assertWritable(cwd, filePath, mode) {
 function writeFile(cwd, filePath, content, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  fs5.mkdirSync(path5.dirname(fullPath), { recursive: true });
-  fs5.writeFileSync(fullPath, content, "utf8");
+  fs6.mkdirSync(path6.dirname(fullPath), { recursive: true });
+  fs6.writeFileSync(fullPath, content, "utf8");
   return `Wrote ${filePath}`;
 }
 function appendFile(cwd, filePath, content, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  fs5.mkdirSync(path5.dirname(fullPath), { recursive: true });
-  fs5.appendFileSync(fullPath, content, "utf8");
+  fs6.mkdirSync(path6.dirname(fullPath), { recursive: true });
+  fs6.appendFileSync(fullPath, content, "utf8");
   return `Appended ${filePath}`;
 }
 function patchFile(cwd, filePath, findText, replaceText, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  const source = fs5.readFileSync(fullPath, "utf8");
+  const source = fs6.readFileSync(fullPath, "utf8");
   if (!source.includes(findText)) {
     return `Pattern not found in ${filePath}`;
   }
   const next = source.replace(findText, replaceText);
-  fs5.writeFileSync(fullPath, next, "utf8");
+  fs6.writeFileSync(fullPath, next, "utf8");
   return `Patched ${filePath}`;
 }
 function deleteFile(cwd, filePath, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  if (!fs5.existsSync(fullPath)) {
+  if (!fs6.existsSync(fullPath)) {
     return `File does not exist: ${filePath}`;
   }
-  fs5.unlinkSync(fullPath);
+  fs6.unlinkSync(fullPath);
   return `Deleted ${filePath}`;
 }
 function searchInFiles(cwd, pattern, glob = "**/*.{ts,tsx,js,jsx,py,go,rs,java,md,json,yml,yaml}") {
@@ -708,7 +1072,7 @@ function searchInFiles(cwd, pattern, glob = "**/*.{ts,tsx,js,jsx,py,go,rs,java,m
   });
   const results = [];
   for (const file of files.slice(0, 700)) {
-    const content = fs5.readFileSync(path5.join(cwd, file), "utf8");
+    const content = fs6.readFileSync(path6.join(cwd, file), "utf8");
     const lines = content.split(/\r?\n/);
     lines.forEach((line, idx) => {
       if (line.includes(pattern)) {
@@ -740,12 +1104,25 @@ function normalizeCommand2(command) {
 function sessionApprovalPrefix(command) {
   return normalizeCommand2(command).split(" ").slice(0, 2).join(" ").trim();
 }
-function buildApprovalPayload(command) {
+function reasonCodeFromPolicyReason(reason) {
+  if (reason.startsWith("Command matches denied pattern:")) {
+    return "deny_pattern";
+  }
+  if (reason.startsWith("Command not in policy allowShellPrefixes.")) {
+    return "not_allowed_prefix";
+  }
+  return "approval_required";
+}
+function buildApprovalPayload(command, reasonCode = "approval_required", policyReason = "") {
   const normalized = normalizeCommand2(command);
+  const prefix = sessionApprovalPrefix(command) || normalized;
+  const reasonLine = reasonCode === "deny_pattern" ? `High-risk command matched deny pattern. ${policyReason}` : reasonCode === "not_allowed_prefix" ? `Command prefix is not allowed by policy. ${policyReason}` : "Command requires explicit approval in current mode.";
   const payload = {
     title: "Shell approval required",
     question: `Allow shell command in current mode?
-${command}`,
+${command}
+
+${reasonLine.trim()}`,
     types: ["single_choice"],
     options: [
       {
@@ -756,7 +1133,12 @@ ${command}`,
       {
         id: "allow_session",
         label: "Allow session prefix",
-        description: `Allow this command prefix for current session: ${sessionApprovalPrefix(command) || normalized}`
+        description: `Allow this command prefix for current session: ${prefix}`
+      },
+      {
+        id: "allow_global",
+        label: "Allow global prefix",
+        description: `Allow this command prefix globally: ${prefix}`
       },
       {
         id: "deny",
@@ -765,11 +1147,13 @@ ${command}`,
       }
     ],
     defaultType: "single_choice",
-    defaultOptionId: "deny",
+    defaultOptionId: "allow_once",
     meta: {
       command,
       normalized,
-      sessionPrefix: sessionApprovalPrefix(command)
+      sessionPrefix: sessionApprovalPrefix(command),
+      reasonCode,
+      policyReason
     }
   };
   return `${APPROVAL_REQUIRED_PREFIX}${JSON.stringify(payload)}`;
@@ -778,6 +1162,7 @@ async function runTool(call, context) {
   const policy = getModePolicy(context.mode);
   const runtimePolicy = loadPolicy(context.cwd);
   try {
+    assertNotAborted(context);
     if (call.name === "get_context") {
       const payload = JSON.stringify(
         {
@@ -806,20 +1191,25 @@ async function runTool(call, context) {
     let output = "";
     switch (call.name) {
       case "list_files": {
+        assertNotAborted(context);
         const pattern = stringArg(call.args, "pattern", "**/*");
         output = JSON.stringify(await listFiles(context.cwd, pattern), null, 2);
         break;
       }
       case "read_file":
+        assertNotAborted(context);
         output = readFile(context.cwd, stringArg(call.args, "path"));
         break;
       case "write_file":
+        assertNotAborted(context);
         output = writeFile(context.cwd, stringArg(call.args, "path"), stringArg(call.args, "content"), context.mode);
         break;
       case "append_file":
+        assertNotAborted(context);
         output = appendFile(context.cwd, stringArg(call.args, "path"), stringArg(call.args, "content"), context.mode);
         break;
       case "patch_file":
+        assertNotAborted(context);
         output = patchFile(
           context.cwd,
           stringArg(call.args, "path"),
@@ -829,9 +1219,11 @@ async function runTool(call, context) {
         );
         break;
       case "delete_file":
+        assertNotAborted(context);
         output = deleteFile(context.cwd, stringArg(call.args, "path"), context.mode);
         break;
       case "search_in_files":
+        assertNotAborted(context);
         output = searchInFiles(
           context.cwd,
           stringArg(call.args, "pattern"),
@@ -839,41 +1231,44 @@ async function runTool(call, context) {
         );
         break;
       case "run_shell": {
+        assertNotAborted(context);
         const command = stringArg(call.args, "command");
         if (context.mode !== "auto") {
+          const usedOneTimeApproval = consumeOneTimeApproval(command, context.cwd);
+          const approvedInSession = !usedOneTimeApproval && isSessionApprovedCommand(command, context.cwd);
+          const approvedGlobally = !usedOneTimeApproval && isGloballyApprovedCommand(command);
+          const isApproved = usedOneTimeApproval || approvedInSession || approvedGlobally;
           const check = validateShellCommand(command, runtimePolicy);
-          if (!check.ok) {
-            output = `Denied by security policy: ${check.reason ?? "unsafe command."}`;
-            audit(context, call, false, output);
+          if (!isApproved && !check.ok) {
+            const reason = check.reason ?? "unsafe command.";
+            const reasonCode = reasonCodeFromPolicyReason(reason);
+            output = buildApprovalPayload(command, reasonCode, reason);
+            audit(context, call, false, `Approval required before shell execution (${reasonCode}).`);
             return output;
           }
-          if (!consumeOneTimeApproval(command, context.cwd)) {
-            const approvedInSession = isSessionApprovedCommand(command, context.cwd);
-            const approvedGlobally = isGloballyApprovedCommand(command);
-            if (!approvedInSession && !approvedGlobally) {
-              output = buildApprovalPayload(command);
-              audit(context, call, false, "Approval required before shell execution.");
-              return output;
-            }
-          }
-          if (output.startsWith(APPROVAL_REQUIRED_PREFIX)) {
-            audit(context, call, false, output);
+          if (!isApproved) {
+            output = buildApprovalPayload(command, "approval_required");
+            audit(context, call, false, "Approval required before shell execution.");
             return output;
           }
         }
+        assertNotAborted(context);
         output = await runCommand(context.cwd, command, numberArg(call.args, "timeout_ms", 3e4));
         break;
       }
       case "git_status":
+        assertNotAborted(context);
         output = await runCommand(context.cwd, "git status --short --branch");
         break;
       case "git_diff": {
+        assertNotAborted(context);
         const target = stringArg(call.args, "path", "").trim();
         const cmd = target ? `git diff -- ${target}` : "git diff";
         output = await runCommand(context.cwd, cmd);
         break;
       }
       case "git_log": {
+        assertNotAborted(context);
         const count = Math.max(1, Math.min(50, numberArg(call.args, "count", 10)));
         output = await runCommand(context.cwd, `git log --oneline -n ${count}`);
         break;
@@ -1104,12 +1499,14 @@ function parseToolArgs(raw) {
     return {};
   }
 }
-function toOpenAIMessages(messages, mode, systemPrompt, appendSystemPrompt) {
+function toOpenAIMessages(messages, mode, cwd, systemPrompt, appendSystemPrompt) {
+  const memoryPrompt = buildRuntimeMemoryPrompt(cwd);
+  const mergedAppendPrompt = [appendSystemPrompt ?? "", memoryPrompt].filter(Boolean).join("\n\n");
   const merged = [
     BASE_PROMPT,
     systemPrompt ?? "",
     getModePrompt(mode),
-    appendSystemPrompt ?? ""
+    mergedAppendPrompt
   ].map((item) => item.trim()).filter(Boolean).join("\n\n");
   return [{ role: "system", content: merged }, ...messages];
 }
@@ -1149,10 +1546,15 @@ var HappyCodeAgent = class {
     this.model = cfg.model;
   }
   async chatStream(messages, options, onDelta, onToolEvent) {
-    const maxTurns = options.maxTurns ?? 8;
+    const wasAborted = () => options.abortSignal?.aborted === true;
+    if (wasAborted()) {
+      return "Interrupted by user.";
+    }
+    const maxTurns = options.maxTurns ?? 24;
     const running = toOpenAIMessages(
       messages,
       options.mode,
+      options.cwd,
       options.systemPrompt,
       options.appendSystemPrompt
     );
@@ -1162,25 +1564,37 @@ var HappyCodeAgent = class {
     const fallbackModel = options.fallbackModel;
     const createCompletion = async (completionMessages) => {
       try {
-        return await this.client.chat.completions.create({
-          model,
-          messages: completionMessages,
-          tools,
-          tool_choice: "auto"
-        });
+        return await this.client.chat.completions.create(
+          {
+            model,
+            messages: completionMessages,
+            tools,
+            tool_choice: "auto"
+          },
+          options.abortSignal ? { signal: options.abortSignal } : void 0
+        );
       } catch (err) {
+        if (wasAborted()) {
+          throw new Error("Interrupted by user.");
+        }
         if (!fallbackModel) {
           throw err;
         }
-        return await this.client.chat.completions.create({
-          model: fallbackModel,
-          messages: completionMessages,
-          tools,
-          tool_choice: "auto"
-        });
+        return await this.client.chat.completions.create(
+          {
+            model: fallbackModel,
+            messages: completionMessages,
+            tools,
+            tool_choice: "auto"
+          },
+          options.abortSignal ? { signal: options.abortSignal } : void 0
+        );
       }
     };
     for (let turn = 0; turn < maxTurns; turn += 1) {
+      if (wasAborted()) {
+        return "Interrupted by user.";
+      }
       const completion = await createCompletion(running);
       const message = completion.choices[0]?.message;
       if (!message) {
@@ -1197,6 +1611,9 @@ var HappyCodeAgent = class {
         tool_calls: message.tool_calls
       });
       for (const toolCall of message.tool_calls) {
+        if (wasAborted()) {
+          return "Interrupted by user.";
+        }
         if (toolCall.type !== "function") {
           continue;
         }
@@ -1228,9 +1645,13 @@ var HappyCodeAgent = class {
             {
               mode: options.mode,
               cwd: options.cwd,
-              enableAudit: options.enableAudit ?? true
+              enableAudit: options.enableAudit ?? true,
+              abortSignal: options.abortSignal
             }
           );
+        }
+        if (wasAborted()) {
+          return "Interrupted by user.";
         }
         let questionPayload;
         const isUserQuestion = result.startsWith(USER_QUESTION_PREFIX);
@@ -1245,14 +1666,42 @@ var HappyCodeAgent = class {
           if (questionPayload && options.onUserQuestion) {
             try {
               const answer = await options.onUserQuestion(questionPayload);
-              result = JSON.stringify(
-                {
-                  kind: "user_question_answer",
-                  answer
-                },
-                null,
-                2
-              );
+              if (isApprovalQuestion) {
+                const optionId = typeof answer.optionId === "string" ? answer.optionId : "";
+                const shouldRetry = ["allow_once", "allow_session", "allow_global"].includes(optionId);
+                if (shouldRetry) {
+                  result = await runTool(
+                    {
+                      name: toolName,
+                      args: toolArgs
+                    },
+                    {
+                      mode: options.mode,
+                      cwd: options.cwd,
+                      enableAudit: options.enableAudit ?? true,
+                      abortSignal: options.abortSignal
+                    }
+                  );
+                } else {
+                  result = JSON.stringify(
+                    {
+                      kind: "user_question_answer",
+                      answer
+                    },
+                    null,
+                    2
+                  );
+                }
+              } else {
+                result = JSON.stringify(
+                  {
+                    kind: "user_question_answer",
+                    answer
+                  },
+                  null,
+                  2
+                );
+              }
             } catch (err) {
               result = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
             }
@@ -1284,27 +1733,37 @@ var HappyCodeAgent = class {
         });
       }
     }
-    return "Stopped after max tool turns. Please refine your request.";
+    return `Stopped after max tool turns (${maxTurns}). Increase --max-turns or split the task into smaller steps.`;
   }
 };
 
 // src/config.ts
-import fs6 from "fs";
-import os5 from "os";
-import path6 from "path";
-var CONFIG_DIR = path6.join(os5.homedir(), ".happycode");
-var CONFIG_PATH = path6.join(CONFIG_DIR, "config.json");
+import fs7 from "fs";
+import os6 from "os";
+import path7 from "path";
+var DEFAULT_MAX_TURNS = 24;
+var MIN_MAX_TURNS = 1;
+var MAX_MAX_TURNS = 200;
+function parseMaxTurns(value) {
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_MAX_TURNS;
+  }
+  return Math.max(MIN_MAX_TURNS, Math.min(MAX_MAX_TURNS, Math.trunc(parsed)));
+}
+var CONFIG_DIR = path7.join(os6.homedir(), ".happycode");
+var CONFIG_PATH = path7.join(CONFIG_DIR, "config.json");
 function getConfigPath() {
   return CONFIG_PATH;
 }
 function ensureConfigDir() {
-  fs6.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs7.mkdirSync(CONFIG_DIR, { recursive: true });
 }
 function readConfig() {
-  if (!fs6.existsSync(CONFIG_PATH)) {
+  if (!fs7.existsSync(CONFIG_PATH)) {
     return null;
   }
-  const raw = fs6.readFileSync(CONFIG_PATH, "utf8");
+  const raw = fs7.readFileSync(CONFIG_PATH, "utf8");
   const parsed = JSON.parse(raw);
   if (!parsed.baseUrl || !parsed.apiKey) {
     return null;
@@ -1312,16 +1771,22 @@ function readConfig() {
   return {
     baseUrl: parsed.baseUrl,
     apiKey: parsed.apiKey,
-    model: parsed.model ?? "gpt-4o-mini"
+    model: parsed.model ?? "gpt-4o-mini",
+    maxTurns: parseMaxTurns(parsed.maxTurns)
   };
 }
 function writeConfig(config) {
   ensureConfigDir();
-  fs6.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
+  fs7.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
 `, "utf8");
 }
 
 export {
+  getMemoryPath,
+  getProjectMemoryPath,
+  ensureMemoryFile,
+  openMemoryFile,
+  buildRuntimeMemoryPrompt,
   getModePolicy,
   getModePrompt,
   SUPPORTED_MODES,
@@ -1348,6 +1813,11 @@ export {
   loadSessionToolEvents,
   saveSessionToolEvents,
   clearSession,
+  getInputHistory,
+  appendInputHistoryEntry,
+  bindPlanToActiveSession,
+  setActiveSessionPlanPhase,
+  clearActiveSessionPlanBinding,
   renameActiveSession,
   forkActiveSession,
   rewindActiveSession,

@@ -24,9 +24,14 @@ import type { McpClientManager } from './mcp_client.js';
 import { type AgentMode } from './modes.js';
 import { getGlobalPolicyPath, getPolicyPath, writeDefaultGlobalPolicy, writeDefaultPolicy } from './policy.js';
 import {
+  appendInputHistoryEntry,
   approveCommandForSession,
   approveCommandOnce,
+  bindPlanToActiveSession,
+  clearActiveSessionPlanBinding,
   clearSessionApprovals,
+  getInputHistory,
+  type InputHistoryEntry,
   listSessionApprovals,
   listSessions,
   loadActiveSession,
@@ -34,12 +39,25 @@ import {
   loadSessionToolEvents,
   renameActiveSession,
   rewindActiveSession,
+  setActiveSessionPlanPhase,
   type SessionRecord,
   saveSessionMessages,
   saveSessionToolEvents,
   switchSession
 } from './session.js';
 import { MultiAgentRuntime } from './agents_runtime.js';
+import {
+  createPlanArtifacts,
+  enterSolvingPhase,
+  ensureSolvingTaskConsistency,
+  formatTaskProgressLine,
+  formatTaskSummary,
+  formatTaskTodos,
+  loadTaskSnapshot,
+  parseTaskOutcomeFromAssistantReply,
+  updateCurrentTaskOutcome
+} from './plan_mode_state.js';
+import { capturePreTurnSnapshot, rollbackCode, type PreTurnSnapshot, type RollbackMode } from './rollback.js';
 
 type Props = {
   agent: HappyCodeAgent;
@@ -150,6 +168,7 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/compact', complete: '/compact', desc: 'Compact context' },
   { cmd: '/review', complete: '/review', desc: 'Review current git diff' },
   { cmd: '/plan', complete: '/plan', desc: 'Generate implementation plan' },
+  { cmd: '/solve', complete: '/solve', desc: 'Enter solve phase for active plan' },
   { cmd: '/test [command]', complete: '/test', desc: 'Run tests via tools' },
   { cmd: '/fix', complete: '/fix', desc: 'Investigate and fix issues' },
   { cmd: '/theme', complete: '/theme ', desc: 'Get or set UI theme' },
@@ -450,12 +469,31 @@ export function App({
   const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
   const [memoryPickerOpen, setMemoryPickerOpen] = useState(false);
   const [memoryPickerCursor, setMemoryPickerCursor] = useState(0);
+  const [taskProgressLine, setTaskProgressLine] = useState('');
+  const [rollbackArmedUntil, setRollbackArmedUntil] = useState<number | null>(null);
+  const [inputHistory, setInputHistory] = useState<InputHistoryEntry[]>([]);
+  const [historyBrowseActive, setHistoryBrowseActive] = useState(false);
+  const [historyBrowseIndex, setHistoryBrowseIndex] = useState<number | null>(null);
+  const [draftBeforeHistoryBrowse, setDraftBeforeHistoryBrowse] = useState('');
+  const [rollbackHistoryPickerOpen, setRollbackHistoryPickerOpen] = useState(false);
+  const [rollbackHistoryCursor, setRollbackHistoryCursor] = useState(0);
   const pendingQuestionResolveRef = useRef<((answer: Record<string, unknown>) => void) | null>(null);
   const toolSeqRef = useRef(0);
   const toolTurnRef = useRef(0);
   const toolEventsHydratedRef = useRef(false);
   const streamingBufferRef = useRef('');
   const streamingFlushTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const interruptControllerRef = useRef<AbortController | null>(null);
+  const preTurnSnapshotRef = useRef<PreTurnSnapshot | null>(null);
+  const snapshotByHistoryIdRef = useRef<Map<string, PreTurnSnapshot>>(new Map());
+
+  const rollbackCandidates = useMemo(() => {
+    return inputHistory.filter((item) => snapshotByHistoryIdRef.current.has(item.id));
+  }, [inputHistory]);
+
+  const visibleRollbackCandidates = useMemo(() => {
+    return rollbackCandidates.slice(-20);
+  }, [rollbackCandidates]);
 
   const themeStyle = THEME_STYLES[theme];
   const projectPath = useMemo(() => process.cwd(), []);
@@ -476,6 +514,60 @@ export function App({
     setSelectedTypeIndex(0);
     setSelectedOptionIndex(0);
   }, []);
+
+  const executeRollback = useCallback(
+    (mode: RollbackMode, historyEntryId?: string) => {
+      const snapshot = historyEntryId
+        ? snapshotByHistoryIdRef.current.get(historyEntryId) ?? null
+        : preTurnSnapshotRef.current;
+      if (!snapshot) {
+        if (historyEntryId) {
+          const selected = inputHistory.find((item) => item.id === historyEntryId);
+          if (selected) {
+            setInput(selected.text);
+            setInputKey((prev) => prev + 1);
+            setError('No rollback snapshot for this history item. Restored input draft only.');
+            return;
+          }
+        }
+        setError('No rollback snapshot available.');
+        return;
+      }
+
+      if (mode === 'keep') {
+        setError('Rollback cancelled.');
+        return;
+      }
+
+      setHistory(snapshot.history);
+      onHistoryChange?.(snapshot.history);
+      setToolEvents(snapshot.toolEvents as ToolTimelineEvent[]);
+      toolSeqRef.current = (snapshot.toolEvents as ToolTimelineEvent[]).reduce(
+        (max, item) => (item.seq > max ? item.seq : max),
+        0
+      );
+      toolTurnRef.current = (snapshot.toolEvents as ToolTimelineEvent[]).reduce(
+        (max, item) => (item.turn > max ? item.turn : max),
+        0
+      );
+      setInputHistory(snapshot.inputHistoryBeforeTurn);
+      setHistoryBrowseActive(false);
+      setHistoryBrowseIndex(null);
+      setDraftBeforeHistoryBrowse('');
+      setSuggestionIndex(snapshot.suggestionIndexBeforeTurn);
+      setInput(snapshot.inputBeforeTurn);
+      setInputKey((prev) => prev + 1);
+      setError('Rolled back dialogue to selected point.');
+
+      if (mode === 'dialogue_only') {
+        return;
+      }
+
+      const code = rollbackCode(snapshot);
+      setError(code.ok ? `Rolled back dialogue + code. ${code.message}` : `Dialogue rolled back, code rollback failed: ${code.message}`);
+    },
+    [inputHistory, onHistoryChange]
+  );
 
   const confirmUserQuestion = useCallback(() => {
     if (!pendingUserQuestion || !pendingQuestionResolveRef.current) {
@@ -516,8 +608,19 @@ export function App({
     const resolver = pendingQuestionResolveRef.current;
     pendingQuestionResolveRef.current = null;
     closeUserQuestion();
+
+    if (pendingUserQuestion.title === 'Rollback code as well?') {
+      const optionId = answer.optionId;
+      const mode: RollbackMode =
+        optionId === 'rollback_both' ? 'both' : optionId === 'rollback_dialogue' ? 'dialogue_only' : 'keep';
+      const selectedId = typeof pendingUserQuestion.meta?.historyEntryId === 'string' ? pendingUserQuestion.meta.historyEntryId : undefined;
+      executeRollback(mode, selectedId);
+      resolver(answer);
+      return;
+    }
+
     resolver(answer);
-  }, [closeUserQuestion, pendingUserQuestion, selectedOptionIndex, selectedTypeIndex]);
+  }, [closeUserQuestion, executeRollback, pendingUserQuestion, selectedOptionIndex, selectedTypeIndex]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -581,6 +684,10 @@ export function App({
       toolSeqRef.current = switchedEvents.reduce((max, item) => (item.seq > max ? item.seq : max), 0);
       toolTurnRef.current = switchedEvents.reduce((max, item) => (item.turn > max ? item.turn : max), 0);
       onHistoryChange?.(switched.messages);
+      setInputHistory(switched.inputHistory ?? []);
+      setHistoryBrowseActive(false);
+      setHistoryBrowseIndex(null);
+      setDraftBeforeHistoryBrowse('');
     },
     [onHistoryChange]
   );
@@ -614,6 +721,43 @@ export function App({
     },
     []
   );
+
+  const refreshTaskProgressLine = useCallback(() => {
+    const active = loadActiveSession(process.cwd());
+    if (!active.activePlanId) {
+      setTaskProgressLine('');
+      return;
+    }
+    const snapshot = loadTaskSnapshot(active.activePlanId);
+    if (!snapshot) {
+      setTaskProgressLine('');
+      return;
+    }
+    setTaskProgressLine(formatTaskProgressLine(snapshot));
+  }, []);
+
+  useEffect(() => {
+    refreshTaskProgressLine();
+  }, [history, refreshTaskProgressLine]);
+
+  useEffect(() => {
+    setInputHistory(getInputHistory(process.cwd()));
+  }, []);
+
+  useEffect(() => {
+    if (!rollbackArmedUntil) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setRollbackArmedUntil((current) => {
+        if (!current || Date.now() >= current) {
+          return null;
+        }
+        return current;
+      });
+    }, Math.max(0, rollbackArmedUntil - Date.now()));
+    return () => clearTimeout(timer);
+  }, [rollbackArmedUntil]);
 
   const confirmMemorySelection = useCallback(() => {
     const selected = memoryPickerItems[memoryPickerCursor];
@@ -689,6 +833,77 @@ export function App({
   }, [inputSuggestions]);
 
   useInput((inputKey, key) => {
+    const now = Date.now();
+    if (key.escape && !pendingUserQuestion && !rollbackHistoryPickerOpen && !resumePickerOpen && !memoryPickerOpen) {
+      const armed = rollbackArmedUntil !== null && now <= rollbackArmedUntil;
+      if (armed) {
+        setRollbackArmedUntil(null);
+        if (visibleRollbackCandidates.length === 0) {
+          setError('No rollback points available.');
+          return;
+        }
+        setRollbackHistoryPickerOpen(true);
+        setRollbackHistoryCursor(visibleRollbackCandidates.length - 1);
+        return;
+      }
+
+      if (loading && interruptControllerRef.current) {
+        interruptControllerRef.current.abort();
+      }
+      setRollbackArmedUntil(now + 1200);
+      setError(
+        loading
+          ? 'Interrupted. Press Esc again within 1.2s to open rollback list.'
+          : 'Press Esc again within 1.2s to open rollback list.'
+      );
+      return;
+    }
+
+    if (rollbackHistoryPickerOpen) {
+      if (key.escape) {
+        setRollbackHistoryPickerOpen(false);
+        return;
+      }
+      if (visibleRollbackCandidates.length === 0) {
+        setRollbackHistoryPickerOpen(false);
+        return;
+      }
+      if (key.upArrow) {
+        setRollbackHistoryCursor((prev) => Math.max(0, prev - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setRollbackHistoryCursor((prev) => Math.min(visibleRollbackCandidates.length - 1, prev + 1));
+        return;
+      }
+      if (key.return) {
+        const selected = visibleRollbackCandidates[rollbackHistoryCursor];
+        if (!selected) {
+          return;
+        }
+        setRollbackHistoryPickerOpen(false);
+        setQuestionFocus('option');
+        setSelectedTypeIndex(0);
+        setSelectedOptionIndex(0);
+        setPendingUserQuestion({
+          title: 'Rollback code as well?',
+          question: `Selected input: ${selected.text.slice(0, 80)}${selected.text.length > 80 ? '...' : ''}`,
+          types: ['single_choice'],
+          options: [
+            { id: 'rollback_both', label: 'Rollback code + dialogue', description: 'Restore files and conversation.' },
+            { id: 'rollback_dialogue', label: 'Rollback dialogue only', description: 'Keep code changes.' },
+            { id: 'keep', label: 'Keep current state', description: 'Do not rollback.' }
+          ],
+          defaultType: 'single_choice',
+          defaultOptionId: 'rollback_both',
+          meta: { kind: 'rollback_confirm', historyEntryId: selected.id }
+        });
+        pendingQuestionResolveRef.current = () => {};
+        return;
+      }
+      return;
+    }
+
     if (pendingUserQuestion) {
       if (key.escape) {
         closeUserQuestion();
@@ -728,6 +943,10 @@ export function App({
         return;
       }
 
+      return;
+    }
+
+    if (rollbackHistoryPickerOpen) {
       return;
     }
 
@@ -788,6 +1007,38 @@ export function App({
       return;
     }
 
+    if (!loading && !pendingUserQuestion && !resumePickerOpen && !memoryPickerOpen && inputHistory.length > 0) {
+      if (key.upArrow) {
+        if (!historyBrowseActive) {
+          setHistoryBrowseActive(true);
+          setDraftBeforeHistoryBrowse(input);
+          const index = inputHistory.length - 1;
+          setHistoryBrowseIndex(index);
+          setInputAtEnd(inputHistory[index]?.text ?? '');
+          return;
+        }
+        const current = historyBrowseIndex ?? inputHistory.length;
+        const next = Math.max(0, current - 1);
+        setHistoryBrowseIndex(next);
+        setInputAtEnd(inputHistory[next]?.text ?? '');
+        return;
+      }
+
+      if (key.downArrow && historyBrowseActive) {
+        const current = historyBrowseIndex ?? inputHistory.length - 1;
+        const next = current + 1;
+        if (next >= inputHistory.length) {
+          setHistoryBrowseActive(false);
+          setHistoryBrowseIndex(null);
+          setInputAtEnd(draftBeforeHistoryBrowse);
+          return;
+        }
+        setHistoryBrowseIndex(next);
+        setInputAtEnd(inputHistory[next]?.text ?? '');
+        return;
+      }
+    }
+
     if (inputSuggestions.length === 0) {
       return;
     }
@@ -818,9 +1069,26 @@ export function App({
   });
 
   const runAgentTask = useCallback(
-    async (taskPrompt: string, modeOverride?: AgentMode): Promise<void> => {
-      const mentionFiles = parseMentionFiles(taskPrompt, process.cwd());
-      let enhancedPrompt = taskPrompt;
+      async (taskPrompt: string, modeOverride?: AgentMode, historyEntryIdOverride?: string): Promise<void> => {
+        const historyEntryId = historyEntryIdOverride ?? inputHistory[inputHistory.length - 1]?.id ?? '';
+        preTurnSnapshotRef.current = capturePreTurnSnapshot({
+          historyEntryId,
+          cwd: process.cwd(),
+          history,
+          toolEvents: toolEvents as Array<Record<string, unknown>>,
+          inputBeforeTurn: input,
+          inputHistoryBeforeTurn: inputHistory,
+          suggestionIndexBeforeTurn: suggestionIndex
+        });
+        if (historyEntryId && preTurnSnapshotRef.current) {
+          snapshotByHistoryIdRef.current.set(historyEntryId, preTurnSnapshotRef.current);
+        }
+        const abortController = new AbortController();
+        interruptControllerRef.current = abortController;
+        setRollbackArmedUntil(null);
+        const effectiveMode = modeOverride ?? runtime.mode;
+        const mentionFiles = parseMentionFiles(taskPrompt, process.cwd());
+        let enhancedPrompt = taskPrompt;
       if (mentionFiles.length > 0) {
         const inline = mentionFiles
           .map((file) => {
@@ -862,11 +1130,11 @@ export function App({
 
       try {
         const mcpTools = mcpManager ? await mcpManager.listTools() : [];
-        const reply = await agent.chatStream(
-          nextHistory,
-          {
-            mode: modeOverride ?? runtime.mode,
-            cwd: process.cwd(),
+          const reply = await agent.chatStream(
+            nextHistory,
+            {
+              mode: effectiveMode,
+              cwd: process.cwd(),
             enableAudit,
             model: runtime.model,
             fallbackModel: runtime.fallbackModel,
@@ -876,11 +1144,12 @@ export function App({
             systemPrompt: runtime.systemPrompt,
             appendSystemPrompt: runtime.appendSystemPrompt,
             mcpTools,
-            mcpCall: mcpManager
-              ? (fullName, args) => mcpManager.callTool(fullName, args)
-              : undefined,
-            onUserQuestion: (payload) =>
-              new Promise<Record<string, unknown>>((resolve) => {
+              mcpCall: mcpManager
+                ? (fullName, args) => mcpManager.callTool(fullName, args)
+                : undefined,
+              abortSignal: abortController.signal,
+              onUserQuestion: (payload) =>
+                new Promise<Record<string, unknown>>((resolve) => {
                 const parsed = {
                   title: typeof payload.title === 'string' ? payload.title : 'Need your decision',
                   question: typeof payload.question === 'string' ? payload.question : 'Please choose an option.',
@@ -935,13 +1204,54 @@ export function App({
             };
             setToolEvents((prev) => [...prev.slice(-(MAX_TOOL_EVENTS_STORE - 1)), timelineEvent]);
           }
-        );
+          );
 
-        setHistory((prev) => {
-          const assistantMessage: ChatMessage = { role: 'assistant', content: reply };
-          const updated = [...prev, assistantMessage];
-          onHistoryChange?.(updated);
-          return updated;
+          let finalReply = reply;
+          if (effectiveMode === 'plan') {
+            const active = loadActiveSession(process.cwd());
+            const persisted = createPlanArtifacts({
+              sessionId: active.id,
+              planText: reply,
+              sourcePrompt: taskPrompt
+            });
+            if (persisted) {
+              bindPlanToActiveSession(persisted.planId, persisted.planId, 'planning', process.cwd());
+              finalReply = `${reply}\n\n---\nplan_state: saved\nplan_id: ${persisted.planId}\nphase: planning\ntasks: ${persisted.snapshot.stats.total}`;
+              setTaskProgressLine(formatTaskProgressLine(persisted.snapshot));
+            }
+          } else {
+            const active = loadActiveSession(process.cwd());
+            if (active.activePlanId && active.planSolvePhase === 'solving') {
+              const parsed = parseTaskOutcomeFromAssistantReply(reply);
+              if (parsed) {
+                const updated = updateCurrentTaskOutcome(active.activePlanId, parsed.outcome, {
+                  note: parsed.note,
+                  source: 'assistant_reply'
+                });
+                if (updated) {
+                  finalReply = `${reply}\n\n---\n${formatTaskProgressLine(updated)}`;
+                  if (updated.phase === 'completed') {
+                    setActiveSessionPlanPhase('completed', process.cwd());
+                  }
+                  setTaskProgressLine(formatTaskProgressLine(updated));
+                }
+              } else {
+                const healed = ensureSolvingTaskConsistency(active.activePlanId, 'turn_consistency');
+                if (healed) {
+                  if (healed.phase === 'completed') {
+                    setActiveSessionPlanPhase('completed', process.cwd());
+                  }
+                  setTaskProgressLine(formatTaskProgressLine(healed));
+                }
+              }
+            }
+          }
+
+          setHistory((prev) => {
+            const assistantMessage: ChatMessage = { role: 'assistant', content: finalReply };
+            const updated = [...prev, assistantMessage];
+            onHistoryChange?.(updated);
+            return updated;
         });
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
@@ -953,16 +1263,24 @@ export function App({
       } catch (err) {
         pendingQuestionResolveRef.current = null;
         closeUserQuestion();
-        setError(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        if (abortController.signal.aborted || /Interrupted by user\./i.test(message)) {
+          pushAssistant('Interrupted by user.', setHistory, onHistoryChange);
+        } else {
+          setError(message);
+        }
       } finally {
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
           streamingFlushTimerRef.current = null;
         }
         setLoading(false);
+        if (interruptControllerRef.current === abortController) {
+          interruptControllerRef.current = null;
+        }
       }
     },
-    [agent, enableAudit, history, onHistoryChange, runtime]
+    [agent, enableAudit, history, input, inputHistory, onHistoryChange, runtime, suggestionIndex, toolEvents]
   );
 
   const handleSlashCommand = useCallback(
@@ -984,7 +1302,10 @@ export function App({
           `history_messages: ${history.length}`,
           'tool_details: always',
           `theme: ${theme}`,
-          `active_session: ${active.id} (${active.name})`
+          `active_session: ${active.id} (${active.name})`,
+          `active_plan: ${active.activePlanId ?? '(none)'}`,
+          `plan_phase: ${active.planSolvePhase ?? 'planning'}`,
+          `task_progress: ${taskProgressLine || '(none)'}`
         ].join('\n');
         pushAssistant(status, setHistory, onHistoryChange);
         return true;
@@ -1071,6 +1392,14 @@ export function App({
       }
 
       if (content === '/new') {
+        clearActiveSessionPlanBinding(process.cwd());
+        setTaskProgressLine('');
+        preTurnSnapshotRef.current = null;
+        snapshotByHistoryIdRef.current.clear();
+        setHistoryBrowseActive(false);
+        setHistoryBrowseIndex(null);
+        setDraftBeforeHistoryBrowse('');
+        setRollbackHistoryPickerOpen(false);
         setHistory([]);
         onHistoryChange?.([]);
         setToolEvents([]);
@@ -1108,6 +1437,25 @@ export function App({
         return true;
       }
 
+      if (content === '/solve') {
+        const active = loadActiveSession(process.cwd());
+        const planId = active.activePlanId;
+        if (!planId) {
+          pushAssistant('No active plan is bound to this session yet.', setHistory, onHistoryChange);
+          return true;
+        }
+        const next = enterSolvingPhase(planId, 'slash_solve');
+        if (!next) {
+          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
+          return true;
+        }
+        setActiveSessionPlanPhase('solving', process.cwd());
+        setTaskProgressLine(formatTaskProgressLine(next));
+        preTurnSnapshotRef.current = null;
+        pushAssistant(formatTaskSummary(next), setHistory, onHistoryChange);
+        return true;
+      }
+
       if (content.startsWith('/test')) {
         const custom = content.replace('/test', '').trim();
         const testPrompt = custom
@@ -1126,12 +1474,48 @@ export function App({
       }
 
       if (content === '/tasks') {
-        void runAgentTask('List pending implementation tasks with priorities and next action.', 'plan');
+        const active = loadActiveSession(process.cwd());
+        const planId = active.activePlanId;
+        if (!planId) {
+          pushAssistant('No active plan state found. Use plan mode to generate a plan first.', setHistory, onHistoryChange);
+          return true;
+        }
+        const snapshot = loadTaskSnapshot(planId);
+        if (!snapshot) {
+          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
+          return true;
+        }
+        if (snapshot.phase === 'solving') {
+          const healed = ensureSolvingTaskConsistency(planId, 'slash_tasks') ?? snapshot;
+          setTaskProgressLine(formatTaskProgressLine(healed));
+          pushAssistant(formatTaskSummary(healed), setHistory, onHistoryChange);
+          return true;
+        }
+        setTaskProgressLine(formatTaskProgressLine(snapshot));
+        pushAssistant(formatTaskSummary(snapshot), setHistory, onHistoryChange);
         return true;
       }
 
       if (content === '/todos') {
-        void runAgentTask('Generate concise TODO checklist using markdown task items.', 'plan');
+        const active = loadActiveSession(process.cwd());
+        const planId = active.activePlanId;
+        if (!planId) {
+          pushAssistant('No active plan state found. Use plan mode to generate a plan first.', setHistory, onHistoryChange);
+          return true;
+        }
+        const snapshot = loadTaskSnapshot(planId);
+        if (!snapshot) {
+          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
+          return true;
+        }
+        if (snapshot.phase === 'solving') {
+          const healed = ensureSolvingTaskConsistency(planId, 'slash_todos') ?? snapshot;
+          setTaskProgressLine(formatTaskProgressLine(healed));
+          pushAssistant(`plan_id: ${healed.planId}\nphase: ${healed.phase}\n\n${formatTaskTodos(healed)}`, setHistory, onHistoryChange);
+          return true;
+        }
+        setTaskProgressLine(formatTaskProgressLine(snapshot));
+        pushAssistant(`plan_id: ${snapshot.planId}\nphase: ${snapshot.phase}\n\n${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
         return true;
       }
 
@@ -1169,6 +1553,14 @@ export function App({
       }
 
       if (content === '/clear') {
+        clearActiveSessionPlanBinding(process.cwd());
+        setTaskProgressLine('');
+        preTurnSnapshotRef.current = null;
+        snapshotByHistoryIdRef.current.clear();
+        setHistoryBrowseActive(false);
+        setHistoryBrowseIndex(null);
+        setDraftBeforeHistoryBrowse('');
+        setRollbackHistoryPickerOpen(false);
         setHistory([]);
         onHistoryChange?.([]);
         return true;
@@ -1462,10 +1854,17 @@ export function App({
       closeResumePicker,
       enableAudit,
       history,
+      inputHistory,
+      loading,
+      memoryPickerOpen,
       onHistoryChange,
+      pendingUserQuestion,
+      resumePickerOpen,
       runAgentTask,
       openMemoryByScope,
-      runtime
+      rollbackHistoryPickerOpen,
+      runtime,
+      taskProgressLine
     ]
   );
 
@@ -1482,6 +1881,10 @@ export function App({
 
     if (memoryPickerOpen) {
       confirmMemorySelection();
+      return;
+    }
+
+    if (rollbackHistoryPickerOpen) {
       return;
     }
 
@@ -1525,6 +1928,16 @@ export function App({
 
     setError(null);
     setInput('');
+    let nextInputHistory = inputHistory;
+    let historyEntryIdForTurn = '';
+    if (content.trim()) {
+      nextInputHistory = appendInputHistoryEntry(content, process.cwd());
+      setInputHistory(nextInputHistory);
+      historyEntryIdForTurn = nextInputHistory[nextInputHistory.length - 1]?.id ?? '';
+    }
+    setHistoryBrowseActive(false);
+    setHistoryBrowseIndex(null);
+    setDraftBeforeHistoryBrowse('');
 
     if (content.startsWith('/')) {
       const handled = handleSlashCommand(content);
@@ -1534,12 +1947,16 @@ export function App({
       return;
     }
 
-    await runAgentTask(content);
+    await runAgentTask(content, undefined, historyEntryIdForTurn);
   }, [
     inputSuggestions,
+    draftBeforeHistoryBrowse,
     exit,
     handleSlashCommand,
+    historyBrowseActive,
+    historyBrowseIndex,
     input,
+    inputHistory,
     loading,
     onHistoryChange,
     runAgentTask,
@@ -1550,8 +1967,15 @@ export function App({
     suggestionIndex,
     resumePickerOpen,
     memoryPickerOpen,
+    rollbackHistoryPickerOpen,
     pendingUserQuestion
   ]);
+
+  useEffect(() => {
+    if (!loading) {
+      setRollbackArmedUntil(null);
+    }
+  }, [loading]);
 
   const visibleResumeCandidates = useMemo(() => {
     if (!resumePickerOpen) {
@@ -1778,6 +2202,19 @@ export function App({
           <Text color={modeDisplay.color}>{modeDisplay.label}</Text>
           <Text color="gray"> - {modeDisplay.hint} (Shift+Tab to cycle)</Text>
         </Box>
+        {taskProgressLine ? (
+          <Box marginTop={1}>
+            <Text color="cyan">Task Progress: </Text>
+            <Text color="gray">{taskProgressLine}</Text>
+          </Box>
+        ) : null}
+        {historyBrowseActive ? (
+          <Box>
+            <Text color="gray">
+              Input History: {(historyBrowseIndex ?? 0) + 1}/{inputHistory.length} (↑/↓ browse, Enter submit)
+            </Text>
+          </Box>
+        ) : null}
       </Box>
 
       {inputSuggestions.length > 0 ? (
@@ -1833,6 +2270,22 @@ export function App({
             return (
               <Text key={item.scope} color={selected ? 'cyan' : 'white'}>
                 {selected ? '>' : ' '} {item.label}
+              </Text>
+            );
+          })}
+        </Box>
+      ) : null}
+
+      {rollbackHistoryPickerOpen ? (
+        <Box marginTop={1} flexDirection="column" width={contentWidth}>
+          <Text color="white">Rollback Points (↑/↓ choose, Enter confirm, Esc cancel)</Text>
+          {visibleRollbackCandidates.map((item, idx) => {
+            const selected = idx === rollbackHistoryCursor;
+            const preview = item.text.replace(/\r\n/g, ' ').replace(/\n/g, ' ').slice(0, 90);
+            return (
+              <Text key={item.id} color={selected ? 'cyan' : 'white'}>
+                {selected ? '>' : ' '} {preview}
+                <Text color="gray"> ({item.createdAt})</Text>
               </Text>
             );
           })}

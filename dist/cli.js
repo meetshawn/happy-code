@@ -3,9 +3,12 @@ import {
   HappyCodeAgent,
   SUPPORTED_MODES,
   allowGlobalCommandPrefix,
+  appendInputHistoryEntry,
   approveCommandForSession,
   approveCommandOnce,
+  bindPlanToActiveSession,
   buildRuntimeMemoryPrompt,
+  clearActiveSessionPlanBinding,
   clearGlobalCommandApprovals,
   clearSession,
   clearSessionApprovals,
@@ -17,6 +20,7 @@ import {
   getConfigPath,
   getGlobalApprovalPrefixes,
   getGlobalPolicyPath,
+  getInputHistory,
   getLegacySessionPath,
   getMemoryPath,
   getPolicyPath,
@@ -35,11 +39,12 @@ import {
   rewindActiveSession,
   saveSessionMessages,
   saveSessionToolEvents,
+  setActiveSessionPlanPhase,
   switchSession,
   writeConfig,
   writeDefaultGlobalPolicy,
   writeDefaultPolicy
-} from "./chunk-HBQOEFEV.js";
+} from "./chunk-4U5RDCXH.js";
 
 // src/cli.ts
 import React2 from "react";
@@ -257,11 +262,722 @@ var McpClientManager = class {
 };
 
 // src/ui.tsx
-import fs2 from "fs";
-import path2 from "path";
+import fs4 from "fs";
+import path4 from "path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
+
+// src/plan_mode_state.ts
+import fs2 from "fs";
+import os from "os";
+import path2 from "path";
+var HAPPYCODE_ROOT = path2.join(os.homedir(), ".happycode");
+var PLANS_DIR = path2.join(HAPPYCODE_ROOT, "plans");
+var TASKS_DIR = path2.join(HAPPYCODE_ROOT, "tasks");
+var SNAPSHOT_DIR = path2.join(PLANS_DIR, ".snapshots");
+var META_START = "<!-- HAPPYCODE_PLAN_META_START -->";
+var META_END = "<!-- HAPPYCODE_PLAN_META_END -->";
+function nowIso() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function ensureStorageDirs() {
+  fs2.mkdirSync(PLANS_DIR, { recursive: true });
+  fs2.mkdirSync(TASKS_DIR, { recursive: true });
+  fs2.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+}
+function randomId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function planMarkdownPath(planId) {
+  return path2.join(PLANS_DIR, `${planId}.md`);
+}
+function planMetaPath(planId) {
+  return path2.join(PLANS_DIR, `${planId}.meta.json`);
+}
+function taskSnapshotPath(planId) {
+  return path2.join(TASKS_DIR, `${planId}.json`);
+}
+function taskEventsPath(planId) {
+  return path2.join(TASKS_DIR, `${planId}.events.ndjson`);
+}
+function writeJson(filePath, payload) {
+  fs2.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}
+`, "utf8");
+}
+function appendTaskEvent(planId, event) {
+  fs2.appendFileSync(taskEventsPath(planId), `${JSON.stringify(event)}
+`, "utf8");
+}
+function computeStats(items) {
+  return {
+    total: items.length,
+    todo: items.filter((item) => item.status === "todo").length,
+    doing: items.filter((item) => item.status === "doing").length,
+    done: items.filter((item) => item.status === "done").length,
+    blocked: items.filter((item) => item.status === "blocked").length
+  };
+}
+function computeProgress(items) {
+  const total = items.length;
+  const done = items.filter((item) => item.status === "done").length;
+  const percent = total > 0 ? Number((done / total * 100).toFixed(1)) : 0;
+  return {
+    done,
+    total,
+    percent
+  };
+}
+function findCurrentTaskId(items) {
+  return items.find((item) => item.status === "doing")?.id;
+}
+function normalizeTitle(raw) {
+  return raw.replace(/^[\-\*]\s*(?:\[[ xX\-]\]\s*)?/, "").replace(/^\d+[\.)\]:：]\s*/, "").trim();
+}
+function extractPlanItems(planText) {
+  const lines = planText.replace(/\r\n/g, "\n").split("\n");
+  const items = lines.map((line) => line.trim()).filter(Boolean).filter((line) => /^[-*]\s+\S+/.test(line) || /^\d+[\.)\]:：]\s+\S+/.test(line)).map(normalizeTitle).filter((title) => title.length > 0);
+  return Array.from(new Set(items));
+}
+function statusToCheckbox(status) {
+  if (status === "done") {
+    return "[x]";
+  }
+  if (status === "doing") {
+    return "[-]";
+  }
+  return "[ ]";
+}
+function checkboxToStatus(checkbox, blockedReason) {
+  if (checkbox === "[x]") {
+    return "done";
+  }
+  if (checkbox === "[-]") {
+    return "doing";
+  }
+  return blockedReason ? "blocked" : "todo";
+}
+function renderPlanMarkdown(meta, items) {
+  const lines = [];
+  lines.push(`# Task Plan: ${meta.planId}`);
+  lines.push("");
+  lines.push(META_START);
+  lines.push(JSON.stringify(meta, null, 2));
+  lines.push(META_END);
+  lines.push("");
+  lines.push("## Meta");
+  lines.push(`- plan_id: ${meta.planId}`);
+  lines.push(`- session_id: ${meta.sessionId}`);
+  lines.push(`- phase: ${meta.phase}`);
+  lines.push(`- created_at: ${meta.createdAt}`);
+  lines.push(`- updated_at: ${meta.updatedAt}`);
+  lines.push("");
+  lines.push("## Steps");
+  for (const item of items) {
+    lines.push(`- ${statusToCheckbox(item.status)} ${item.id} ${item.title}`);
+    if (item.notes) {
+      lines.push(`  - note: ${item.notes}`);
+    }
+    if (item.blockedReason) {
+      lines.push(`  - blocked: ${item.blockedReason}`);
+    }
+    if (item.startedAt) {
+      lines.push(`  - started_at: ${item.startedAt}`);
+    }
+    if (item.completedAt) {
+      lines.push(`  - completed_at: ${item.completedAt}`);
+    }
+  }
+  lines.push("");
+  lines.push("## Execution Log");
+  lines.push("- initialized");
+  lines.push("");
+  return `${lines.join("\n")}`;
+}
+function parseMetaBlock(markdown) {
+  const start = markdown.indexOf(META_START);
+  const end = markdown.indexOf(META_END);
+  if (start < 0 || end < 0 || end <= start) {
+    return null;
+  }
+  const body = markdown.slice(start + META_START.length, end).trim();
+  if (!body) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed.planId !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function parseItems(markdown) {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const items = [];
+  let current = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const stepMatch = line.match(/^\s*[-*]\s*(\[[ xX\-]\])\s+(task_\d+)\s+(.+)$/);
+    if (stepMatch) {
+      const checkbox = stepMatch[1].toLowerCase() === "[x]" ? "[x]" : stepMatch[1] === "[-]" ? "[-]" : "[ ]";
+      const item = {
+        id: stepMatch[2],
+        title: stepMatch[3].trim(),
+        status: checkboxToStatus(checkbox),
+        updatedAt: nowIso()
+      };
+      items.push(item);
+      current = item;
+      continue;
+    }
+    if (!current) {
+      continue;
+    }
+    const noteMatch = line.match(/^\s*[-*]\s+note:\s*(.+)$/i);
+    if (noteMatch) {
+      current.notes = noteMatch[1].trim();
+      continue;
+    }
+    const blockedMatch = line.match(/^\s*[-*]\s+blocked:\s*(.+)$/i);
+    if (blockedMatch) {
+      current.blockedReason = blockedMatch[1].trim();
+      current.status = "blocked";
+      continue;
+    }
+    const startedMatch = line.match(/^\s*[-*]\s+started_at:\s*(.+)$/i);
+    if (startedMatch) {
+      current.startedAt = startedMatch[1].trim();
+      continue;
+    }
+    const completedMatch = line.match(/^\s*[-*]\s+completed_at:\s*(.+)$/i);
+    if (completedMatch) {
+      current.completedAt = completedMatch[1].trim();
+      continue;
+    }
+  }
+  return items;
+}
+function parsePlanMarkdown(planId) {
+  const filePath = planMarkdownPath(planId);
+  if (!fs2.existsSync(filePath)) {
+    return null;
+  }
+  const body = fs2.readFileSync(filePath, "utf8");
+  const meta = parseMetaBlock(body);
+  if (!meta) {
+    return null;
+  }
+  const items = parseItems(body);
+  const bodyLines = body.replace(/\r\n/g, "\n").split("\n");
+  return {
+    meta,
+    items,
+    bodyLines
+  };
+}
+function writePlanMarkdown(planId, meta, items, logLine) {
+  const filePath = planMarkdownPath(planId);
+  const existing = fs2.existsSync(filePath) ? fs2.readFileSync(filePath, "utf8") : "";
+  const next = renderPlanMarkdown(meta, items);
+  const logSegment = existing.includes("## Execution Log") ? existing.slice(existing.indexOf("## Execution Log")).split("\n").slice(1).filter((line) => line.trim().length > 0) : [];
+  if (logLine) {
+    logSegment.push(`- ${logLine}`);
+  }
+  const merged = `${next.replace(/\n\s*## Execution Log\n- initialized\n?\s*$/m, "")}
+## Execution Log
+${logSegment.length > 0 ? logSegment.join("\n") : "- initialized"}
+`;
+  if (existing) {
+    const snapDir = path2.join(SNAPSHOT_DIR, planId);
+    fs2.mkdirSync(snapDir, { recursive: true });
+    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[\:\.]/g, "-");
+    fs2.writeFileSync(path2.join(snapDir, `${stamp}.md`), existing, "utf8");
+    const snapshots = fs2.readdirSync(snapDir).filter((name) => name.endsWith(".md")).sort();
+    if (snapshots.length > 20) {
+      for (const old of snapshots.slice(0, snapshots.length - 20)) {
+        fs2.unlinkSync(path2.join(snapDir, old));
+      }
+    }
+  }
+  fs2.writeFileSync(filePath, merged, "utf8");
+}
+function toSnapshot(meta, items) {
+  const normalizedItems = items.map((item) => ({
+    ...item,
+    status: item.blockedReason ? item.status === "done" ? "done" : "blocked" : item.status
+  }));
+  const stats = computeStats(normalizedItems);
+  const progress = computeProgress(normalizedItems);
+  const phase = meta.phase !== "completed" && progress.total > 0 && progress.done === progress.total && stats.blocked === 0 ? "completed" : meta.phase;
+  const currentTaskId = meta.currentTaskId ?? findCurrentTaskId(normalizedItems);
+  return {
+    planId: meta.planId,
+    sessionId: meta.sessionId,
+    phase,
+    items: normalizedItems,
+    progress,
+    currentTaskId,
+    lastUpdatedTaskId: meta.lastUpdatedTaskId,
+    blockedCount: stats.blocked,
+    stats,
+    createdAt: meta.createdAt,
+    updatedAt: meta.updatedAt
+  };
+}
+function migrateLegacyJsonIfNeeded(planId) {
+  const markdownFile = planMarkdownPath(planId);
+  if (fs2.existsSync(markdownFile)) {
+    return false;
+  }
+  const legacyPath = taskSnapshotPath(planId);
+  if (!fs2.existsSync(legacyPath)) {
+    return false;
+  }
+  try {
+    const legacy = JSON.parse(fs2.readFileSync(legacyPath, "utf8"));
+    if (!legacy || !Array.isArray(legacy.items) || typeof legacy.sessionId !== "string") {
+      return false;
+    }
+    ensureStorageDirs();
+    const meta = {
+      planId,
+      sessionId: legacy.sessionId,
+      phase: legacy.phase ?? "planning",
+      createdAt: legacy.createdAt ?? nowIso(),
+      updatedAt: legacy.updatedAt ?? nowIso(),
+      currentTaskId: legacy.currentTaskId,
+      lastUpdatedTaskId: legacy.lastUpdatedTaskId
+    };
+    writePlanMarkdown(planId, meta, legacy.items, "migrated_from_json");
+    appendTaskEvent(planId, {
+      eventType: "migrated_from_json",
+      planId,
+      ts: nowIso(),
+      source: "migration"
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function createPlanArtifacts(args) {
+  const steps = extractPlanItems(args.planText);
+  if (steps.length < 2) {
+    return null;
+  }
+  ensureStorageDirs();
+  const createdAt = nowIso();
+  const planId = args.planId ?? randomId();
+  const meta = {
+    planId,
+    sessionId: args.sessionId,
+    phase: "planning",
+    createdAt,
+    updatedAt: createdAt,
+    sourcePrompt: args.sourcePrompt
+  };
+  const items = steps.map((title, index) => ({
+    id: `task_${index + 1}`,
+    title,
+    status: "todo",
+    updatedAt: createdAt
+  }));
+  writeJson(planMetaPath(planId), {
+    ...meta,
+    sourcePrompt: args.sourcePrompt
+  });
+  writePlanMarkdown(planId, meta, items, "plan_created");
+  appendTaskEvent(planId, {
+    eventType: "plan_created",
+    planId,
+    ts: createdAt,
+    source: "mode_plan"
+  });
+  const snapshot = toSnapshot(meta, items);
+  writeJson(taskSnapshotPath(planId), snapshot);
+  return {
+    planId,
+    snapshot
+  };
+}
+function loadTaskSnapshot(planId) {
+  ensureStorageDirs();
+  migrateLegacyJsonIfNeeded(planId);
+  const parsed = parsePlanMarkdown(planId);
+  if (!parsed) {
+    return null;
+  }
+  const snapshot = toSnapshot(parsed.meta, parsed.items);
+  writeJson(taskSnapshotPath(planId), snapshot);
+  return snapshot;
+}
+function saveTaskSnapshot(snapshot) {
+  ensureStorageDirs();
+  const meta = {
+    planId: snapshot.planId,
+    sessionId: snapshot.sessionId,
+    phase: snapshot.phase,
+    createdAt: snapshot.createdAt,
+    updatedAt: nowIso(),
+    currentTaskId: snapshot.currentTaskId,
+    lastUpdatedTaskId: snapshot.lastUpdatedTaskId
+  };
+  const items = snapshot.items.map((item) => ({ ...item, updatedAt: item.updatedAt || meta.updatedAt }));
+  writePlanMarkdown(snapshot.planId, meta, items, "snapshot_saved");
+  const next = toSnapshot(meta, items);
+  writeJson(taskSnapshotPath(snapshot.planId), next);
+  return next;
+}
+function enterSolvingPhase(planId, source = "ui") {
+  const snapshot = loadTaskSnapshot(planId);
+  if (!snapshot) {
+    return null;
+  }
+  const ts = nowIso();
+  const items = snapshot.items.map((item) => ({ ...item }));
+  let currentTaskId = snapshot.currentTaskId;
+  const existingDoing = items.find((item) => item.status === "doing");
+  if (!existingDoing) {
+    const firstTodo = items.find((item) => item.status === "todo");
+    if (firstTodo) {
+      firstTodo.status = "doing";
+      firstTodo.startedAt = firstTodo.startedAt ?? ts;
+      firstTodo.attempts = (firstTodo.attempts ?? 0) + 1;
+      firstTodo.updatedAt = ts;
+      currentTaskId = firstTodo.id;
+      appendTaskEvent(planId, {
+        eventType: "task_started",
+        planId,
+        taskId: firstTodo.id,
+        from: "todo",
+        to: "doing",
+        ts,
+        source
+      });
+    }
+  } else {
+    currentTaskId = existingDoing.id;
+  }
+  appendTaskEvent(planId, {
+    eventType: "phase_changed",
+    planId,
+    from: snapshot.phase,
+    to: "solving",
+    ts,
+    source
+  });
+  return saveTaskSnapshot({
+    ...snapshot,
+    phase: "solving",
+    currentTaskId,
+    lastUpdatedTaskId: currentTaskId,
+    items
+  });
+}
+function startNextTodoTask(planId, items, source) {
+  const nextItems = items.map((item) => ({ ...item }));
+  const nextTodo = nextItems.find((item) => item.status === "todo");
+  if (!nextTodo) {
+    return {
+      items: nextItems,
+      currentTaskId: void 0
+    };
+  }
+  const ts = nowIso();
+  nextTodo.status = "doing";
+  nextTodo.updatedAt = ts;
+  nextTodo.startedAt = nextTodo.startedAt ?? ts;
+  nextTodo.attempts = (nextTodo.attempts ?? 0) + 1;
+  appendTaskEvent(planId, {
+    eventType: "task_started",
+    planId,
+    taskId: nextTodo.id,
+    from: "todo",
+    to: "doing",
+    ts,
+    source
+  });
+  return {
+    items: nextItems,
+    currentTaskId: nextTodo.id
+  };
+}
+function updateCurrentTaskOutcome(planId, outcome, options) {
+  const snapshot = loadTaskSnapshot(planId);
+  if (!snapshot || snapshot.phase !== "solving") {
+    return snapshot;
+  }
+  const source = options?.source ?? "runtime";
+  const note = options?.note?.trim() ?? "";
+  const ts = nowIso();
+  const items = snapshot.items.map((item) => ({ ...item }));
+  const current = items.find((item) => item.status === "doing");
+  if (!current) {
+    return snapshot;
+  }
+  if (outcome === "doing") {
+    if (!note) {
+      return snapshot;
+    }
+    current.notes = note;
+    current.updatedAt = ts;
+    appendTaskEvent(planId, {
+      eventType: "task_note_updated",
+      planId,
+      taskId: current.id,
+      ts,
+      source,
+      note
+    });
+    return saveTaskSnapshot({
+      ...snapshot,
+      items,
+      currentTaskId: current.id,
+      lastUpdatedTaskId: current.id
+    });
+  }
+  if (outcome === "blocked") {
+    current.status = "blocked";
+    current.blockedReason = note || current.blockedReason;
+    current.notes = note || current.notes;
+    current.updatedAt = ts;
+    appendTaskEvent(planId, {
+      eventType: "task_blocked",
+      planId,
+      taskId: current.id,
+      from: "doing",
+      to: "blocked",
+      ts,
+      source,
+      note
+    });
+    return saveTaskSnapshot({
+      ...snapshot,
+      items,
+      currentTaskId: void 0,
+      lastUpdatedTaskId: current.id
+    });
+  }
+  current.status = "done";
+  current.completedAt = ts;
+  current.updatedAt = ts;
+  if (note) {
+    current.notes = note;
+  }
+  appendTaskEvent(planId, {
+    eventType: "task_completed",
+    planId,
+    taskId: current.id,
+    from: "doing",
+    to: "done",
+    ts,
+    source,
+    note
+  });
+  const withNext = startNextTodoTask(planId, items, source);
+  return saveTaskSnapshot({
+    ...snapshot,
+    items: withNext.items,
+    currentTaskId: withNext.currentTaskId,
+    lastUpdatedTaskId: current.id
+  });
+}
+function ensureSolvingTaskConsistency(planId, source = "self_heal") {
+  const snapshot = loadTaskSnapshot(planId);
+  if (!snapshot || snapshot.phase !== "solving") {
+    return snapshot;
+  }
+  const doingCount = snapshot.items.filter((item) => item.status === "doing").length;
+  if (doingCount > 0) {
+    return snapshot;
+  }
+  const hasTodo = snapshot.items.some((item) => item.status === "todo");
+  if (!hasTodo) {
+    return saveTaskSnapshot(snapshot);
+  }
+  const withNext = startNextTodoTask(planId, snapshot.items, source);
+  return saveTaskSnapshot({
+    ...snapshot,
+    items: withNext.items,
+    currentTaskId: withNext.currentTaskId
+  });
+}
+function parseTaskOutcomeFromAssistantReply(reply) {
+  const normalized = reply.replace(/\r\n/g, "\n");
+  const stateMatch = normalized.match(/^TASK_STATE:\s*(done|blocked|doing)\s*$/gim);
+  if (!stateMatch || stateMatch.length === 0) {
+    return null;
+  }
+  const lastStateLine = stateMatch[stateMatch.length - 1] ?? "";
+  const outcomeMatch = lastStateLine.match(/(done|blocked|doing)/i);
+  if (!outcomeMatch) {
+    return null;
+  }
+  const noteMatch = normalized.match(/^TASK_NOTE:\s*(.*)$/gim);
+  const note = noteMatch && noteMatch.length > 0 ? noteMatch[noteMatch.length - 1]?.replace(/^TASK_NOTE:\s*/i, "").trim() : "";
+  return {
+    outcome: outcomeMatch[1].toLowerCase(),
+    note: note || void 0
+  };
+}
+function formatTaskProgressLine(snapshot) {
+  const current = snapshot.items.find((item) => item.id === snapshot.currentTaskId);
+  return [
+    `plan=${snapshot.planId}`,
+    `phase=${snapshot.phase}`,
+    `progress=${snapshot.progress.done}/${snapshot.progress.total} (${snapshot.progress.percent}%)`,
+    `doing=${current ? current.title : "none"}`,
+    `blocked=${snapshot.blockedCount}`
+  ].join(" | ");
+}
+function sortByStatus(items) {
+  const order = {
+    doing: 0,
+    blocked: 1,
+    todo: 2,
+    done: 3
+  };
+  return [...items].sort((a, b) => {
+    const left = order[a.status] ?? 9;
+    const right = order[b.status] ?? 9;
+    if (left !== right) {
+      return left - right;
+    }
+    return a.id.localeCompare(b.id);
+  });
+}
+function formatTaskSummary(snapshot) {
+  const header = [
+    `plan_id: ${snapshot.planId}`,
+    `phase: ${snapshot.phase}`,
+    `progress: ${snapshot.progress.done}/${snapshot.progress.total} (${snapshot.progress.percent}%)`,
+    `stats: total=${snapshot.stats.total} todo=${snapshot.stats.todo} doing=${snapshot.stats.doing} blocked=${snapshot.stats.blocked} done=${snapshot.stats.done}`,
+    `current_task: ${snapshot.items.find((item) => item.id === snapshot.currentTaskId)?.title ?? "(none)"}`
+  ];
+  const rows = sortByStatus(snapshot.items).map(
+    (item) => `- [${item.status}] ${item.id} ${item.title}${item.notes ? ` (${item.notes})` : ""}${item.blockedReason ? ` [reason: ${item.blockedReason}]` : ""}`
+  );
+  return [...header, "", ...rows].join("\n");
+}
+function formatTaskTodos(snapshot) {
+  const lines = snapshot.items.map((item) => {
+    const checked = item.status === "done" ? "x" : item.status === "doing" ? "-" : " ";
+    const statusTag = item.status === "done" ? "" : ` (${item.status})`;
+    return `- [${checked}] ${item.title}${statusTag}`;
+  });
+  return lines.join("\n");
+}
+
+// src/rollback.ts
+import fs3 from "fs";
+import path3 from "path";
+import { execSync } from "child_process";
+function listFilesSafe(cwd) {
+  try {
+    const output = execSync("git ls-files", {
+      cwd,
+      stdio: ["ignore", "pipe", "ignore"]
+    }).toString("utf8").trim();
+    if (!output) {
+      return [];
+    }
+    return output.split(/\r?\n/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+function fileExists(cwd, relPath) {
+  return fs3.existsSync(path3.join(cwd, relPath));
+}
+function readFileOptional(cwd, relPath) {
+  const full = path3.join(cwd, relPath);
+  if (!fs3.existsSync(full)) {
+    return null;
+  }
+  try {
+    return fs3.readFileSync(full, "utf8");
+  } catch {
+    return null;
+  }
+}
+function capturePreTurnSnapshot(args) {
+  const gitFiles = listFilesSafe(args.cwd);
+  const hadGit = gitFiles.length > 0;
+  const trackedFiles = hadGit ? gitFiles : [];
+  const fileContentsBefore = {};
+  for (const rel of trackedFiles) {
+    fileContentsBefore[rel] = readFileOptional(args.cwd, rel);
+  }
+  return {
+    historyEntryId: args.historyEntryId,
+    cwd: args.cwd,
+    history: [...args.history],
+    toolEvents: [...args.toolEvents],
+    inputBeforeTurn: args.inputBeforeTurn,
+    inputHistoryBeforeTurn: [...args.inputHistoryBeforeTurn],
+    suggestionIndexBeforeTurn: args.suggestionIndexBeforeTurn,
+    trackedFiles,
+    fileContentsBefore,
+    hadGit
+  };
+}
+function rollbackCode(snapshot) {
+  if (!snapshot.hadGit) {
+    return {
+      ok: false,
+      message: "No git repository detected for code rollback."
+    };
+  }
+  const touched = /* @__PURE__ */ new Set();
+  for (const rel of snapshot.trackedFiles) {
+    const before = snapshot.fileContentsBefore[rel] ?? null;
+    const now = readFileOptional(snapshot.cwd, rel);
+    if (before !== now) {
+      touched.add(rel);
+    }
+  }
+  if (touched.size === 0) {
+    return {
+      ok: true,
+      message: "No code changes detected since turn start."
+    };
+  }
+  for (const rel of touched) {
+    const before = snapshot.fileContentsBefore[rel] ?? null;
+    const full = path3.join(snapshot.cwd, rel);
+    if (before === null) {
+      if (fileExists(snapshot.cwd, rel)) {
+        try {
+          fs3.unlinkSync(full);
+        } catch (err) {
+          return {
+            ok: false,
+            message: `Failed to remove ${rel}: ${err instanceof Error ? err.message : String(err)}`
+          };
+        }
+      }
+      continue;
+    }
+    try {
+      fs3.mkdirSync(path3.dirname(full), { recursive: true });
+      fs3.writeFileSync(full, before, "utf8");
+    } catch (err) {
+      return {
+        ok: false,
+        message: `Failed to restore ${rel}: ${err instanceof Error ? err.message : String(err)}`
+      };
+    }
+  }
+  return {
+    ok: true,
+    message: `Restored ${touched.size} file(s).`
+  };
+}
+
+// src/ui.tsx
 import { jsx, jsxs } from "react/jsx-runtime";
 var THEME_STYLES = {
   "black-yellow": {
@@ -294,6 +1010,7 @@ var COMMANDS = [
   { cmd: "/compact", complete: "/compact", desc: "Compact context" },
   { cmd: "/review", complete: "/review", desc: "Review current git diff" },
   { cmd: "/plan", complete: "/plan", desc: "Generate implementation plan" },
+  { cmd: "/solve", complete: "/solve", desc: "Enter solve phase for active plan" },
   { cmd: "/test [command]", complete: "/test", desc: "Run tests via tools" },
   { cmd: "/fix", complete: "/fix", desc: "Investigate and fix issues" },
   { cmd: "/theme", complete: "/theme ", desc: "Get or set UI theme" },
@@ -506,8 +1223,8 @@ function parseMentionFiles(input, cwd) {
   const matches = [...input.matchAll(/@([^\s]+)/g)].map((m) => m[1]).filter(Boolean);
   const files = [];
   for (const item of matches) {
-    const full = path2.resolve(cwd, item);
-    if (fs2.existsSync(full) && fs2.statSync(full).isFile()) {
+    const full = path4.resolve(cwd, item);
+    if (fs4.existsSync(full) && fs4.statSync(full).isFile()) {
       files.push(item);
     }
   }
@@ -557,12 +1274,29 @@ function App({
   const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
   const [memoryPickerOpen, setMemoryPickerOpen] = useState(false);
   const [memoryPickerCursor, setMemoryPickerCursor] = useState(0);
+  const [taskProgressLine, setTaskProgressLine] = useState("");
+  const [rollbackArmedUntil, setRollbackArmedUntil] = useState(null);
+  const [inputHistory, setInputHistory] = useState([]);
+  const [historyBrowseActive, setHistoryBrowseActive] = useState(false);
+  const [historyBrowseIndex, setHistoryBrowseIndex] = useState(null);
+  const [draftBeforeHistoryBrowse, setDraftBeforeHistoryBrowse] = useState("");
+  const [rollbackHistoryPickerOpen, setRollbackHistoryPickerOpen] = useState(false);
+  const [rollbackHistoryCursor, setRollbackHistoryCursor] = useState(0);
   const pendingQuestionResolveRef = useRef(null);
   const toolSeqRef = useRef(0);
   const toolTurnRef = useRef(0);
   const toolEventsHydratedRef = useRef(false);
   const streamingBufferRef = useRef("");
   const streamingFlushTimerRef = useRef(null);
+  const interruptControllerRef = useRef(null);
+  const preTurnSnapshotRef = useRef(null);
+  const snapshotByHistoryIdRef = useRef(/* @__PURE__ */ new Map());
+  const rollbackCandidates = useMemo(() => {
+    return inputHistory.filter((item) => snapshotByHistoryIdRef.current.has(item.id));
+  }, [inputHistory]);
+  const visibleRollbackCandidates = useMemo(() => {
+    return rollbackCandidates.slice(-20);
+  }, [rollbackCandidates]);
   const themeStyle = THEME_STYLES[theme];
   const projectPath = useMemo(() => process.cwd(), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
@@ -580,6 +1314,53 @@ function App({
     setSelectedTypeIndex(0);
     setSelectedOptionIndex(0);
   }, []);
+  const executeRollback = useCallback(
+    (mode, historyEntryId) => {
+      const snapshot = historyEntryId ? snapshotByHistoryIdRef.current.get(historyEntryId) ?? null : preTurnSnapshotRef.current;
+      if (!snapshot) {
+        if (historyEntryId) {
+          const selected = inputHistory.find((item) => item.id === historyEntryId);
+          if (selected) {
+            setInput(selected.text);
+            setInputKey((prev) => prev + 1);
+            setError("No rollback snapshot for this history item. Restored input draft only.");
+            return;
+          }
+        }
+        setError("No rollback snapshot available.");
+        return;
+      }
+      if (mode === "keep") {
+        setError("Rollback cancelled.");
+        return;
+      }
+      setHistory(snapshot.history);
+      onHistoryChange?.(snapshot.history);
+      setToolEvents(snapshot.toolEvents);
+      toolSeqRef.current = snapshot.toolEvents.reduce(
+        (max, item) => item.seq > max ? item.seq : max,
+        0
+      );
+      toolTurnRef.current = snapshot.toolEvents.reduce(
+        (max, item) => item.turn > max ? item.turn : max,
+        0
+      );
+      setInputHistory(snapshot.inputHistoryBeforeTurn);
+      setHistoryBrowseActive(false);
+      setHistoryBrowseIndex(null);
+      setDraftBeforeHistoryBrowse("");
+      setSuggestionIndex(snapshot.suggestionIndexBeforeTurn);
+      setInput(snapshot.inputBeforeTurn);
+      setInputKey((prev) => prev + 1);
+      setError("Rolled back dialogue to selected point.");
+      if (mode === "dialogue_only") {
+        return;
+      }
+      const code = rollbackCode(snapshot);
+      setError(code.ok ? `Rolled back dialogue + code. ${code.message}` : `Dialogue rolled back, code rollback failed: ${code.message}`);
+    },
+    [inputHistory, onHistoryChange]
+  );
   const confirmUserQuestion = useCallback(() => {
     if (!pendingUserQuestion || !pendingQuestionResolveRef.current) {
       return;
@@ -605,13 +1386,26 @@ function App({
         if (value) {
           approveCommandForSession(value, process.cwd());
         }
+      } else if (answer.optionId === "allow_global") {
+        const value = sessionPrefix || command;
+        if (value) {
+          allowGlobalCommandPrefix(value);
+        }
       }
     }
     const resolver = pendingQuestionResolveRef.current;
     pendingQuestionResolveRef.current = null;
     closeUserQuestion();
+    if (pendingUserQuestion.title === "Rollback code as well?") {
+      const optionId = answer.optionId;
+      const mode = optionId === "rollback_both" ? "both" : optionId === "rollback_dialogue" ? "dialogue_only" : "keep";
+      const selectedId = typeof pendingUserQuestion.meta?.historyEntryId === "string" ? pendingUserQuestion.meta.historyEntryId : void 0;
+      executeRollback(mode, selectedId);
+      resolver(answer);
+      return;
+    }
     resolver(answer);
-  }, [closeUserQuestion, pendingUserQuestion, selectedOptionIndex, selectedTypeIndex]);
+  }, [closeUserQuestion, executeRollback, pendingUserQuestion, selectedOptionIndex, selectedTypeIndex]);
   useEffect(() => {
     const handleResize = () => {
       setTerminalColumns(stdout.columns ?? 80);
@@ -668,6 +1462,10 @@ function App({
       toolSeqRef.current = switchedEvents.reduce((max, item) => item.seq > max ? item.seq : max, 0);
       toolTurnRef.current = switchedEvents.reduce((max, item) => item.turn > max ? item.turn : max, 0);
       onHistoryChange?.(switched.messages);
+      setInputHistory(switched.inputHistory ?? []);
+      setHistoryBrowseActive(false);
+      setHistoryBrowseIndex(null);
+      setDraftBeforeHistoryBrowse("");
     },
     [onHistoryChange]
   );
@@ -697,6 +1495,39 @@ function App({
     },
     []
   );
+  const refreshTaskProgressLine = useCallback(() => {
+    const active = loadActiveSession(process.cwd());
+    if (!active.activePlanId) {
+      setTaskProgressLine("");
+      return;
+    }
+    const snapshot = loadTaskSnapshot(active.activePlanId);
+    if (!snapshot) {
+      setTaskProgressLine("");
+      return;
+    }
+    setTaskProgressLine(formatTaskProgressLine(snapshot));
+  }, []);
+  useEffect(() => {
+    refreshTaskProgressLine();
+  }, [history, refreshTaskProgressLine]);
+  useEffect(() => {
+    setInputHistory(getInputHistory(process.cwd()));
+  }, []);
+  useEffect(() => {
+    if (!rollbackArmedUntil) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setRollbackArmedUntil((current) => {
+        if (!current || Date.now() >= current) {
+          return null;
+        }
+        return current;
+      });
+    }, Math.max(0, rollbackArmedUntil - Date.now()));
+    return () => clearTimeout(timer);
+  }, [rollbackArmedUntil]);
   const confirmMemorySelection = useCallback(() => {
     const selected = memoryPickerItems[memoryPickerCursor];
     if (!selected) {
@@ -761,6 +1592,73 @@ function App({
     });
   }, [inputSuggestions]);
   useInput((inputKey2, key) => {
+    const now = Date.now();
+    if (key.escape && !pendingUserQuestion && !rollbackHistoryPickerOpen && !resumePickerOpen && !memoryPickerOpen) {
+      const armed = rollbackArmedUntil !== null && now <= rollbackArmedUntil;
+      if (armed) {
+        setRollbackArmedUntil(null);
+        if (visibleRollbackCandidates.length === 0) {
+          setError("No rollback points available.");
+          return;
+        }
+        setRollbackHistoryPickerOpen(true);
+        setRollbackHistoryCursor(visibleRollbackCandidates.length - 1);
+        return;
+      }
+      if (loading && interruptControllerRef.current) {
+        interruptControllerRef.current.abort();
+      }
+      setRollbackArmedUntil(now + 1200);
+      setError(
+        loading ? "Interrupted. Press Esc again within 1.2s to open rollback list." : "Press Esc again within 1.2s to open rollback list."
+      );
+      return;
+    }
+    if (rollbackHistoryPickerOpen) {
+      if (key.escape) {
+        setRollbackHistoryPickerOpen(false);
+        return;
+      }
+      if (visibleRollbackCandidates.length === 0) {
+        setRollbackHistoryPickerOpen(false);
+        return;
+      }
+      if (key.upArrow) {
+        setRollbackHistoryCursor((prev) => Math.max(0, prev - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setRollbackHistoryCursor((prev) => Math.min(visibleRollbackCandidates.length - 1, prev + 1));
+        return;
+      }
+      if (key.return) {
+        const selected = visibleRollbackCandidates[rollbackHistoryCursor];
+        if (!selected) {
+          return;
+        }
+        setRollbackHistoryPickerOpen(false);
+        setQuestionFocus("option");
+        setSelectedTypeIndex(0);
+        setSelectedOptionIndex(0);
+        setPendingUserQuestion({
+          title: "Rollback code as well?",
+          question: `Selected input: ${selected.text.slice(0, 80)}${selected.text.length > 80 ? "..." : ""}`,
+          types: ["single_choice"],
+          options: [
+            { id: "rollback_both", label: "Rollback code + dialogue", description: "Restore files and conversation." },
+            { id: "rollback_dialogue", label: "Rollback dialogue only", description: "Keep code changes." },
+            { id: "keep", label: "Keep current state", description: "Do not rollback." }
+          ],
+          defaultType: "single_choice",
+          defaultOptionId: "rollback_both",
+          meta: { kind: "rollback_confirm", historyEntryId: selected.id }
+        });
+        pendingQuestionResolveRef.current = () => {
+        };
+        return;
+      }
+      return;
+    }
     if (pendingUserQuestion) {
       if (key.escape) {
         closeUserQuestion();
@@ -795,6 +1693,9 @@ function App({
         confirmUserQuestion();
         return;
       }
+      return;
+    }
+    if (rollbackHistoryPickerOpen) {
       return;
     }
     if (resumePickerOpen) {
@@ -847,6 +1748,36 @@ function App({
       setError(null);
       return;
     }
+    if (!loading && !pendingUserQuestion && !resumePickerOpen && !memoryPickerOpen && inputHistory.length > 0) {
+      if (key.upArrow) {
+        if (!historyBrowseActive) {
+          setHistoryBrowseActive(true);
+          setDraftBeforeHistoryBrowse(input);
+          const index = inputHistory.length - 1;
+          setHistoryBrowseIndex(index);
+          setInputAtEnd(inputHistory[index]?.text ?? "");
+          return;
+        }
+        const current = historyBrowseIndex ?? inputHistory.length;
+        const next = Math.max(0, current - 1);
+        setHistoryBrowseIndex(next);
+        setInputAtEnd(inputHistory[next]?.text ?? "");
+        return;
+      }
+      if (key.downArrow && historyBrowseActive) {
+        const current = historyBrowseIndex ?? inputHistory.length - 1;
+        const next = current + 1;
+        if (next >= inputHistory.length) {
+          setHistoryBrowseActive(false);
+          setHistoryBrowseIndex(null);
+          setInputAtEnd(draftBeforeHistoryBrowse);
+          return;
+        }
+        setHistoryBrowseIndex(next);
+        setInputAtEnd(inputHistory[next]?.text ?? "");
+        return;
+      }
+    }
     if (inputSuggestions.length === 0) {
       return;
     }
@@ -868,13 +1799,30 @@ function App({
     }
   });
   const runAgentTask = useCallback(
-    async (taskPrompt, modeOverride) => {
+    async (taskPrompt, modeOverride, historyEntryIdOverride) => {
+      const historyEntryId = historyEntryIdOverride ?? inputHistory[inputHistory.length - 1]?.id ?? "";
+      preTurnSnapshotRef.current = capturePreTurnSnapshot({
+        historyEntryId,
+        cwd: process.cwd(),
+        history,
+        toolEvents,
+        inputBeforeTurn: input,
+        inputHistoryBeforeTurn: inputHistory,
+        suggestionIndexBeforeTurn: suggestionIndex
+      });
+      if (historyEntryId && preTurnSnapshotRef.current) {
+        snapshotByHistoryIdRef.current.set(historyEntryId, preTurnSnapshotRef.current);
+      }
+      const abortController = new AbortController();
+      interruptControllerRef.current = abortController;
+      setRollbackArmedUntil(null);
+      const effectiveMode = modeOverride ?? runtime.mode;
       const mentionFiles = parseMentionFiles(taskPrompt, process.cwd());
       let enhancedPrompt = taskPrompt;
       if (mentionFiles.length > 0) {
         const inline = mentionFiles.map((file) => {
-          const full = path2.resolve(process.cwd(), file);
-          const content = fs2.readFileSync(full, "utf8").slice(0, 2e4);
+          const full = path4.resolve(process.cwd(), file);
+          const content = fs4.readFileSync(full, "utf8").slice(0, 2e4);
           return `
 [FILE: ${file}]
 ${content}`;
@@ -913,7 +1861,7 @@ Referenced files content:${inline}`;
         const reply = await agent.chatStream(
           nextHistory,
           {
-            mode: modeOverride ?? runtime.mode,
+            mode: effectiveMode,
             cwd: process.cwd(),
             enableAudit,
             model: runtime.model,
@@ -925,6 +1873,7 @@ Referenced files content:${inline}`;
             appendSystemPrompt: runtime.appendSystemPrompt,
             mcpTools,
             mcpCall: mcpManager ? (fullName, args) => mcpManager.callTool(fullName, args) : void 0,
+            abortSignal: abortController.signal,
             onUserQuestion: (payload) => new Promise((resolve) => {
               const parsed = {
                 title: typeof payload.title === "string" ? payload.title : "Need your decision",
@@ -970,8 +1919,57 @@ Referenced files content:${inline}`;
             setToolEvents((prev) => [...prev.slice(-(MAX_TOOL_EVENTS_STORE - 1)), timelineEvent]);
           }
         );
+        let finalReply = reply;
+        if (effectiveMode === "plan") {
+          const active = loadActiveSession(process.cwd());
+          const persisted = createPlanArtifacts({
+            sessionId: active.id,
+            planText: reply,
+            sourcePrompt: taskPrompt
+          });
+          if (persisted) {
+            bindPlanToActiveSession(persisted.planId, persisted.planId, "planning", process.cwd());
+            finalReply = `${reply}
+
+---
+plan_state: saved
+plan_id: ${persisted.planId}
+phase: planning
+tasks: ${persisted.snapshot.stats.total}`;
+            setTaskProgressLine(formatTaskProgressLine(persisted.snapshot));
+          }
+        } else {
+          const active = loadActiveSession(process.cwd());
+          if (active.activePlanId && active.planSolvePhase === "solving") {
+            const parsed = parseTaskOutcomeFromAssistantReply(reply);
+            if (parsed) {
+              const updated = updateCurrentTaskOutcome(active.activePlanId, parsed.outcome, {
+                note: parsed.note,
+                source: "assistant_reply"
+              });
+              if (updated) {
+                finalReply = `${reply}
+
+---
+${formatTaskProgressLine(updated)}`;
+                if (updated.phase === "completed") {
+                  setActiveSessionPlanPhase("completed", process.cwd());
+                }
+                setTaskProgressLine(formatTaskProgressLine(updated));
+              }
+            } else {
+              const healed = ensureSolvingTaskConsistency(active.activePlanId, "turn_consistency");
+              if (healed) {
+                if (healed.phase === "completed") {
+                  setActiveSessionPlanPhase("completed", process.cwd());
+                }
+                setTaskProgressLine(formatTaskProgressLine(healed));
+              }
+            }
+          }
+        }
         setHistory((prev) => {
-          const assistantMessage = { role: "assistant", content: reply };
+          const assistantMessage = { role: "assistant", content: finalReply };
           const updated = [...prev, assistantMessage];
           onHistoryChange?.(updated);
           return updated;
@@ -986,16 +1984,24 @@ Referenced files content:${inline}`;
       } catch (err) {
         pendingQuestionResolveRef.current = null;
         closeUserQuestion();
-        setError(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        if (abortController.signal.aborted || /Interrupted by user\./i.test(message)) {
+          pushAssistant("Interrupted by user.", setHistory, onHistoryChange);
+        } else {
+          setError(message);
+        }
       } finally {
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
           streamingFlushTimerRef.current = null;
         }
         setLoading(false);
+        if (interruptControllerRef.current === abortController) {
+          interruptControllerRef.current = null;
+        }
       }
     },
-    [agent, enableAudit, history, onHistoryChange, runtime]
+    [agent, enableAudit, history, input, inputHistory, onHistoryChange, runtime, suggestionIndex, toolEvents]
   );
   const handleSlashCommand = useCallback(
     (content) => {
@@ -1015,7 +2021,10 @@ Referenced files content:${inline}`;
           `history_messages: ${history.length}`,
           "tool_details: always",
           `theme: ${theme}`,
-          `active_session: ${active.id} (${active.name})`
+          `active_session: ${active.id} (${active.name})`,
+          `active_plan: ${active.activePlanId ?? "(none)"}`,
+          `plan_phase: ${active.planSolvePhase ?? "planning"}`,
+          `task_progress: ${taskProgressLine || "(none)"}`
         ].join("\n");
         pushAssistant(status, setHistory, onHistoryChange);
         return true;
@@ -1085,17 +2094,25 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content === "/doctor") {
         const checks = [
-          `config_exists: ${fs2.existsSync(getConfigPath())}`,
-          `policy_exists: ${fs2.existsSync(getPolicyPath(process.cwd()))}`,
-          `mcp_exists: ${fs2.existsSync(getMcpConfigPath(process.cwd()))}`,
-          `memory_user_exists: ${fs2.existsSync(getMemoryPath())}`,
-          `memory_project_exists: ${fs2.existsSync(getProjectMemoryPath(process.cwd()))}`,
-          `audit_exists: ${fs2.existsSync(getAuditPath())}`
+          `config_exists: ${fs4.existsSync(getConfigPath())}`,
+          `policy_exists: ${fs4.existsSync(getPolicyPath(process.cwd()))}`,
+          `mcp_exists: ${fs4.existsSync(getMcpConfigPath(process.cwd()))}`,
+          `memory_user_exists: ${fs4.existsSync(getMemoryPath())}`,
+          `memory_project_exists: ${fs4.existsSync(getProjectMemoryPath(process.cwd()))}`,
+          `audit_exists: ${fs4.existsSync(getAuditPath())}`
         ].join("\n");
         pushAssistant(checks, setHistory, onHistoryChange);
         return true;
       }
       if (content === "/new") {
+        clearActiveSessionPlanBinding(process.cwd());
+        setTaskProgressLine("");
+        preTurnSnapshotRef.current = null;
+        snapshotByHistoryIdRef.current.clear();
+        setHistoryBrowseActive(false);
+        setHistoryBrowseIndex(null);
+        setDraftBeforeHistoryBrowse("");
+        setRollbackHistoryPickerOpen(false);
         setHistory([]);
         onHistoryChange?.([]);
         setToolEvents([]);
@@ -1129,6 +2146,24 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         );
         return true;
       }
+      if (content === "/solve") {
+        const active = loadActiveSession(process.cwd());
+        const planId = active.activePlanId;
+        if (!planId) {
+          pushAssistant("No active plan is bound to this session yet.", setHistory, onHistoryChange);
+          return true;
+        }
+        const next = enterSolvingPhase(planId, "slash_solve");
+        if (!next) {
+          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
+          return true;
+        }
+        setActiveSessionPlanPhase("solving", process.cwd());
+        setTaskProgressLine(formatTaskProgressLine(next));
+        preTurnSnapshotRef.current = null;
+        pushAssistant(formatTaskSummary(next), setHistory, onHistoryChange);
+        return true;
+      }
       if (content.startsWith("/test")) {
         const custom = content.replace("/test", "").trim();
         const testPrompt = custom ? `Run this test command with tools: ${custom}. Summarize failures and likely root cause.` : "Detect and run the most appropriate test command for this project using tools. Summarize failures and likely root cause.";
@@ -1143,11 +2178,53 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         return true;
       }
       if (content === "/tasks") {
-        void runAgentTask("List pending implementation tasks with priorities and next action.", "plan");
+        const active = loadActiveSession(process.cwd());
+        const planId = active.activePlanId;
+        if (!planId) {
+          pushAssistant("No active plan state found. Use plan mode to generate a plan first.", setHistory, onHistoryChange);
+          return true;
+        }
+        const snapshot = loadTaskSnapshot(planId);
+        if (!snapshot) {
+          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
+          return true;
+        }
+        if (snapshot.phase === "solving") {
+          const healed = ensureSolvingTaskConsistency(planId, "slash_tasks") ?? snapshot;
+          setTaskProgressLine(formatTaskProgressLine(healed));
+          pushAssistant(formatTaskSummary(healed), setHistory, onHistoryChange);
+          return true;
+        }
+        setTaskProgressLine(formatTaskProgressLine(snapshot));
+        pushAssistant(formatTaskSummary(snapshot), setHistory, onHistoryChange);
         return true;
       }
       if (content === "/todos") {
-        void runAgentTask("Generate concise TODO checklist using markdown task items.", "plan");
+        const active = loadActiveSession(process.cwd());
+        const planId = active.activePlanId;
+        if (!planId) {
+          pushAssistant("No active plan state found. Use plan mode to generate a plan first.", setHistory, onHistoryChange);
+          return true;
+        }
+        const snapshot = loadTaskSnapshot(planId);
+        if (!snapshot) {
+          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
+          return true;
+        }
+        if (snapshot.phase === "solving") {
+          const healed = ensureSolvingTaskConsistency(planId, "slash_todos") ?? snapshot;
+          setTaskProgressLine(formatTaskProgressLine(healed));
+          pushAssistant(`plan_id: ${healed.planId}
+phase: ${healed.phase}
+
+${formatTaskTodos(healed)}`, setHistory, onHistoryChange);
+          return true;
+        }
+        setTaskProgressLine(formatTaskProgressLine(snapshot));
+        pushAssistant(`plan_id: ${snapshot.planId}
+phase: ${snapshot.phase}
+
+${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
         return true;
       }
       if (content === "/copy") {
@@ -1182,6 +2259,14 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         return true;
       }
       if (content === "/clear") {
+        clearActiveSessionPlanBinding(process.cwd());
+        setTaskProgressLine("");
+        preTurnSnapshotRef.current = null;
+        snapshotByHistoryIdRef.current.clear();
+        setHistoryBrowseActive(false);
+        setHistoryBrowseIndex(null);
+        setDraftBeforeHistoryBrowse("");
+        setRollbackHistoryPickerOpen(false);
         setHistory([]);
         onHistoryChange?.([]);
         return true;
@@ -1349,11 +2434,11 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content.startsWith("/export")) {
         const target = content.replace("/export", "").trim();
-        const outputPath = target || path2.join(process.cwd(), "happycode-export.md");
+        const outputPath = target || path4.join(process.cwd(), "happycode-export.md");
         const body = history.map((item) => `## ${item.role.toUpperCase()}
 
 ${item.content}`).join("\n\n");
-        fs2.writeFileSync(outputPath, `${body}
+        fs4.writeFileSync(outputPath, `${body}
 `, "utf8");
         pushAssistant(`Exported conversation to: ${outputPath}`, setHistory, onHistoryChange);
         return true;
@@ -1443,10 +2528,17 @@ ${item.content}`).join("\n\n");
       closeResumePicker,
       enableAudit,
       history,
+      inputHistory,
+      loading,
+      memoryPickerOpen,
       onHistoryChange,
+      pendingUserQuestion,
+      resumePickerOpen,
       runAgentTask,
       openMemoryByScope,
-      runtime
+      rollbackHistoryPickerOpen,
+      runtime,
+      taskProgressLine
     ]
   );
   const submit = useCallback(async () => {
@@ -1460,6 +2552,9 @@ ${item.content}`).join("\n\n");
     }
     if (memoryPickerOpen) {
       confirmMemorySelection();
+      return;
+    }
+    if (rollbackHistoryPickerOpen) {
       return;
     }
     const content = input.trim();
@@ -1499,6 +2594,16 @@ Use /help`, setHistory, onHistoryChange);
     }
     setError(null);
     setInput("");
+    let nextInputHistory = inputHistory;
+    let historyEntryIdForTurn = "";
+    if (content.trim()) {
+      nextInputHistory = appendInputHistoryEntry(content, process.cwd());
+      setInputHistory(nextInputHistory);
+      historyEntryIdForTurn = nextInputHistory[nextInputHistory.length - 1]?.id ?? "";
+    }
+    setHistoryBrowseActive(false);
+    setHistoryBrowseIndex(null);
+    setDraftBeforeHistoryBrowse("");
     if (content.startsWith("/")) {
       const handled = handleSlashCommand(content);
       if (!handled) {
@@ -1507,12 +2612,16 @@ Use /help`, setHistory, onHistoryChange);
       }
       return;
     }
-    await runAgentTask(content);
+    await runAgentTask(content, void 0, historyEntryIdForTurn);
   }, [
     inputSuggestions,
+    draftBeforeHistoryBrowse,
     exit,
     handleSlashCommand,
+    historyBrowseActive,
+    historyBrowseIndex,
     input,
+    inputHistory,
     loading,
     onHistoryChange,
     runAgentTask,
@@ -1523,8 +2632,14 @@ Use /help`, setHistory, onHistoryChange);
     suggestionIndex,
     resumePickerOpen,
     memoryPickerOpen,
+    rollbackHistoryPickerOpen,
     pendingUserQuestion
   ]);
+  useEffect(() => {
+    if (!loading) {
+      setRollbackArmedUntil(null);
+    }
+  }, [loading]);
   const visibleResumeCandidates = useMemo(() => {
     if (!resumePickerOpen) {
       return [];
@@ -1705,11 +2820,11 @@ Use /help`, setHistory, onHistoryChange);
     ] }) }) : null,
     /* @__PURE__ */ jsxs(Box, { marginTop: 1, flexDirection: "column", width: contentWidth, children: [
       /* @__PURE__ */ jsxs(Box, { children: [
-        /* @__PURE__ */ jsx(Text, { color: "green", children: ">" }),
+        /* @__PURE__ */ jsx(Text, { color: "green", children: "> " }),
         /* @__PURE__ */ jsx(TextInput, { value: input, onChange: setInput, onSubmit: submit }, inputKey),
         inlineParamPlaceholder ? /* @__PURE__ */ jsx(Text, { color: "gray", children: inlineParamPlaceholder }) : null
       ] }),
-      /* @__PURE__ */ jsxs(Box, { children: [
+      /* @__PURE__ */ jsxs(Box, { marginTop: 1, children: [
         /* @__PURE__ */ jsx(Text, { color: "gray", children: "Mode: " }),
         /* @__PURE__ */ jsx(Text, { color: modeDisplay.color, children: modeDisplay.label }),
         /* @__PURE__ */ jsxs(Text, { color: "gray", children: [
@@ -1717,7 +2832,18 @@ Use /help`, setHistory, onHistoryChange);
           modeDisplay.hint,
           " (Shift+Tab to cycle)"
         ] })
-      ] })
+      ] }),
+      taskProgressLine ? /* @__PURE__ */ jsxs(Box, { marginTop: 1, children: [
+        /* @__PURE__ */ jsx(Text, { color: "cyan", children: "Task Progress: " }),
+        /* @__PURE__ */ jsx(Text, { color: "gray", children: taskProgressLine })
+      ] }) : null,
+      historyBrowseActive ? /* @__PURE__ */ jsx(Box, { children: /* @__PURE__ */ jsxs(Text, { color: "gray", children: [
+        "Input History: ",
+        (historyBrowseIndex ?? 0) + 1,
+        "/",
+        inputHistory.length,
+        " (\u2191/\u2193 browse, Enter submit)"
+      ] }) }) : null
     ] }),
     inputSuggestions.length > 0 ? /* @__PURE__ */ jsxs(Box, { flexDirection: "column", children: [
       /* @__PURE__ */ jsx(Text, { color: "white", children: "Command Hints" }),
@@ -1771,6 +2897,23 @@ Use /help`, setHistory, onHistoryChange);
           " ",
           item.label
         ] }, item.scope);
+      })
+    ] }) : null,
+    rollbackHistoryPickerOpen ? /* @__PURE__ */ jsxs(Box, { marginTop: 1, flexDirection: "column", width: contentWidth, children: [
+      /* @__PURE__ */ jsx(Text, { color: "white", children: "Rollback Points (\u2191/\u2193 choose, Enter confirm, Esc cancel)" }),
+      visibleRollbackCandidates.map((item, idx) => {
+        const selected = idx === rollbackHistoryCursor;
+        const preview = item.text.replace(/\r\n/g, " ").replace(/\n/g, " ").slice(0, 90);
+        return /* @__PURE__ */ jsxs(Text, { color: selected ? "cyan" : "white", children: [
+          selected ? ">" : " ",
+          " ",
+          preview,
+          /* @__PURE__ */ jsxs(Text, { color: "gray", children: [
+            " (",
+            item.createdAt,
+            ")"
+          ] })
+        ] }, item.id);
       })
     ] }) : null
   ] });

@@ -64,11 +64,12 @@ In TUI:
 - `/compact` keep only latest context messages
 - `/review` review current git diff and risks
 - `/plan` generate implementation plan
+- `/solve` enter solve phase for active plan state
 - `/test [command]` run tests and summarize failures
 - `/fix` attempt issue investigation and fix flow
 - `/context`, `/debug`, `/doctor` for diagnostics
 - `/stats` and `/usage` for local usage summary
-- `/tasks` and `/todos` for task extraction
+- `/tasks` and `/todos` for persisted task-state views
 - `/copy` copy latest assistant answer
 - ask coding tasks in natural language
 - `Shift+Tab` quick-switch mode (`plan -> edit -> auto`)
@@ -78,9 +79,11 @@ In TUI:
 - `/clear` clears session history
 - `/exit` or `/quit` exits
 - type `/` to show command hints in TUI
+- use `↑/↓` to browse previous input drafts when no picker/question is open
 - use `↑/↓` to select hints, `Tab` to autocomplete command
 - when input is just `/`, press `Enter` to execute selected command (or insert if args needed)
 - press `Esc` to clear current input quickly
+- while a task is running: press `Esc` once to interrupt; press `Esc` again within 1.2s to open rollback choices
 - use `!<command>` for quick shell workflow via agent tools
 - use `@path/to/file` in prompt to include file content context
 
@@ -172,9 +175,37 @@ Inside TUI:
 
 Mode policy summary:
 
-- `plan`: read-only, produce implementation plan first
+- `plan`: read-only; produces structured plans and persists plan/task state files
 - `edit`: allow file editing + shell execution (with safety policy + approval flow)
 - `auto`: allow file editing + shell execution tools (no approval/safety gating)
+
+Plan-and-solve state files:
+
+- plans: `~/.happycode/plans/<planId>.md` and `~/.happycode/plans/<planId>.meta.json`
+- tasks markdown source-of-truth: `~/.happycode/plans/<planId>.md`
+- compatibility snapshot/events: `~/.happycode/tasks/<planId>.json` and `~/.happycode/tasks/<planId>.events.ndjson`
+- when in `plan` mode, generated actionable plans are auto-persisted and bound to the active session
+- legacy task snapshots (`tasks/<planId>.json`) are auto-migrated into markdown plan state when needed
+
+Progress tracking behavior:
+
+- `/tasks` shows phase, progress (`done/total` + percent), current active task, and blocked count
+- `/todos` renders checklist from persisted state snapshot
+- markdown checkboxes are state source: `[ ]` todo, `[-]` doing, `[x]` done
+- in solve phase, assistant can append control lines to advance state:
+  - `TASK_STATE: done|blocked|doing`
+  - `TASK_NOTE: <short note>` (optional)
+
+Interrupt & rollback behavior:
+
+- first `Esc` during `Thinking...` interrupts current run
+- second `Esc` within 1.2 seconds opens a visible rollback-point list (use `↑/↓`, `Enter`)
+- after selecting a history item, confirm rollback mode:
+  - rollback code + dialogue
+  - rollback dialogue only
+  - keep current state
+- rollback-point list only includes entries with valid snapshots
+- rollback status is shown in status/error line, and no extra chat message is appended
 
 ## Session persistence
 
