@@ -1,0 +1,306 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import type { ChatMessage } from './agent.js';
+
+export type SessionToolEvent = {
+  phase: 'start' | 'end';
+  name: string;
+  args: Record<string, unknown>;
+  ok?: boolean;
+  preview?: string;
+  seq: number;
+  ts: number;
+  turn: number;
+};
+
+export type SessionRecord = {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  messages: ChatMessage[];
+  toolEvents: SessionToolEvent[];
+  projectKey?: string;
+  projectRoot?: string;
+};
+
+const SESSION_ROOT = path.join(os.homedir(), '.happycode', 'sessions');
+const ACTIVE_FILE = path.join(SESSION_ROOT, 'active-session.txt');
+const ACTIVE_MAP_FILE = path.join(SESSION_ROOT, 'active-sessions.json');
+
+function ensureDir(): void {
+  fs.mkdirSync(SESSION_ROOT, { recursive: true });
+}
+
+function safeName(input: string): string {
+  return input.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60) || 'session';
+}
+
+function resolveProjectRoot(cwd: string): string {
+  const target = path.resolve(cwd);
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+
+function toProjectKey(projectRoot: string): string {
+  const normalized = process.platform === 'win32' ? projectRoot.toLowerCase() : projectRoot;
+  return createHash('sha1').update(normalized).digest('hex').slice(0, 16);
+}
+
+function projectMetaFromCwd(cwd: string): { projectRoot: string; projectKey: string } {
+  const projectRoot = resolveProjectRoot(cwd);
+  return {
+    projectRoot,
+    projectKey: toProjectKey(projectRoot)
+  };
+}
+
+function normalizeRecord(record: SessionRecord): SessionRecord {
+  return {
+    ...record,
+    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : []
+  };
+}
+
+function readActiveMap(): Record<string, string> {
+  ensureDir();
+  if (!fs.existsSync(ACTIVE_MAP_FILE)) {
+    return {};
+  }
+  try {
+    const raw = fs.readFileSync(ACTIVE_MAP_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, string>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeActiveMap(map: Record<string, string>): void {
+  ensureDir();
+  fs.writeFileSync(ACTIVE_MAP_FILE, `${JSON.stringify(map, null, 2)}\n`, 'utf8');
+}
+
+function isProjectMatch(record: SessionRecord, projectKey: string): boolean {
+  return !record.projectKey || record.projectKey === projectKey;
+}
+
+function sessionPathById(id: string): string {
+  return path.join(SESSION_ROOT, `${id}.json`);
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function randomId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function getSessionRootPath(): string {
+  ensureDir();
+  return SESSION_ROOT;
+}
+
+export function getLegacySessionPath(): string {
+  return path.join(os.homedir(), '.happycode', 'session.json');
+}
+
+export function createSession(name = 'default', cwd = process.cwd()): SessionRecord {
+  ensureDir();
+  const meta = projectMetaFromCwd(cwd);
+  const id = randomId();
+  const record: SessionRecord = {
+    id,
+    name: safeName(name),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [],
+    toolEvents: [],
+    projectKey: meta.projectKey,
+    projectRoot: meta.projectRoot
+  };
+  saveSessionRecord(record);
+  setActiveSessionId(id, cwd);
+  return record;
+}
+
+export function saveSessionRecord(record: SessionRecord): void {
+  ensureDir();
+  const next: SessionRecord = {
+    ...record,
+    name: safeName(record.name),
+    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
+    updatedAt: nowIso()
+  };
+  fs.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+}
+
+export function loadSessionById(id: string): SessionRecord | null {
+  const p = sessionPathById(id);
+  if (!fs.existsSync(p)) {
+    return null;
+  }
+  try {
+    const raw = fs.readFileSync(p, 'utf8');
+    const parsed = JSON.parse(raw) as SessionRecord;
+    if (!parsed || !Array.isArray(parsed.messages)) {
+      return null;
+    }
+    return normalizeRecord(parsed);
+  } catch {
+    return null;
+  }
+}
+
+export function listSessions(cwd = process.cwd()): SessionRecord[] {
+  ensureDir();
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const files = fs
+    .readdirSync(SESSION_ROOT)
+    .filter((item) => item.endsWith('.json'))
+    .map((item) => path.join(SESSION_ROOT, item));
+
+  const sessions: SessionRecord[] = [];
+  for (const file of files) {
+    try {
+      const raw = fs.readFileSync(file, 'utf8');
+      const parsed = JSON.parse(raw) as SessionRecord;
+      if (parsed && Array.isArray(parsed.messages)) {
+        const normalized = normalizeRecord(parsed);
+        if (isProjectMatch(normalized, projectKey)) {
+          sessions.push(normalized);
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return sessions;
+}
+
+export function setActiveSessionId(id: string, cwd = process.cwd()): void {
+  ensureDir();
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const map = readActiveMap();
+  map[projectKey] = id;
+  writeActiveMap(map);
+  fs.writeFileSync(ACTIVE_FILE, `${id}\n`, 'utf8');
+}
+
+export function getActiveSessionId(cwd = process.cwd()): string | null {
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const map = readActiveMap();
+  const scoped = map[projectKey];
+  if (scoped) {
+    return scoped;
+  }
+
+  if (fs.existsSync(ACTIVE_FILE)) {
+    try {
+      const legacyId = fs.readFileSync(ACTIVE_FILE, 'utf8').trim();
+      if (legacyId) {
+        const record = loadSessionById(legacyId);
+        if (record && isProjectMatch(record, projectKey)) {
+          map[projectKey] = legacyId;
+          writeActiveMap(map);
+          return legacyId;
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+export function loadActiveSession(cwd = process.cwd()): SessionRecord {
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const id = getActiveSessionId(cwd);
+  if (id) {
+    const record = loadSessionById(id);
+    if (record && isProjectMatch(record, projectKey)) {
+      return record;
+    }
+  }
+  return createSession('default', cwd);
+}
+
+export function loadSessionMessages(cwd = process.cwd()): ChatMessage[] {
+  const active = loadActiveSession(cwd);
+  return active.messages;
+}
+
+export function saveSessionMessages(messages: ChatMessage[], cwd = process.cwd()): void {
+  const active = loadActiveSession(cwd);
+  active.messages = messages;
+  saveSessionRecord(active);
+}
+
+export function loadSessionToolEvents(cwd = process.cwd()): SessionToolEvent[] {
+  const active = loadActiveSession(cwd);
+  return active.toolEvents;
+}
+
+export function saveSessionToolEvents(events: SessionToolEvent[], cwd = process.cwd()): void {
+  const active = loadActiveSession(cwd);
+  active.toolEvents = events;
+  saveSessionRecord(active);
+}
+
+export function clearSession(cwd = process.cwd()): void {
+  const active = loadActiveSession(cwd);
+  active.messages = [];
+  active.toolEvents = [];
+  saveSessionRecord(active);
+}
+
+export function renameActiveSession(name: string, cwd = process.cwd()): SessionRecord {
+  const active = loadActiveSession(cwd);
+  active.name = safeName(name);
+  saveSessionRecord(active);
+  return active;
+}
+
+export function forkActiveSession(name?: string, cwd = process.cwd()): SessionRecord {
+  const active = loadActiveSession(cwd);
+  const clone: SessionRecord = {
+    id: randomId(),
+    name: safeName(name ?? `${active.name}_fork`),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [...active.messages],
+    toolEvents: [...active.toolEvents],
+    projectKey: active.projectKey,
+    projectRoot: active.projectRoot
+  };
+  saveSessionRecord(clone);
+  setActiveSessionId(clone.id, cwd);
+  return clone;
+}
+
+export function rewindActiveSession(steps: number, cwd = process.cwd()): SessionRecord {
+  const active = loadActiveSession(cwd);
+  const drop = Math.max(1, steps);
+  active.messages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
+  saveSessionRecord(active);
+  return active;
+}
+
+export function switchSession(id: string, cwd = process.cwd()): SessionRecord | null {
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const target = loadSessionById(id);
+  if (!target || !isProjectMatch(target, projectKey)) {
+    return null;
+  }
+  setActiveSessionId(id, cwd);
+  return target;
+}

@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JSON 格式化工具</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+
+        .main {
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            gap: 20px;
+        }
+
+        @media (min-width: 768px) {
+            .main {
+                flex-direction: row;
+            }
+        }
+
+        .panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-height: 400px;
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .panel-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        textarea {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            resize: none;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        textarea:focus {
+            border-color: #667eea;
+        }
+
+        .output-container {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 14px;
+            overflow: auto;
+            background: #f8f9fa;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 15px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+
+        @media (min-width: 768px) {
+            .controls {
+                justify-content: center;
+            }
+        }
+
+        button {
+            padding: 12px 30px;
+            font-size: 15px;
+            font-weight: 600;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-format {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-format:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-minify {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-minify:hover {
+            background: #5a6268;
+        }
+
+        .btn-clear {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-clear:hover {
+            background: #c82333;
+        }
+
+        .btn-copy {
+            background: #28a745;
+            color: white;
+        }
+
+        .btn-copy:hover {
+            background: #218838;
+        }
+
+        .options {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .option {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 14px;
+            color: #555;
+        }
+
+        .option input[type="number"] {
+            width: 60px;
+            padding: 5px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        /* JSON Syntax Highlighting */
+        .string { color: #22863a; }
+        .number { color: #005cc5; }
+        .boolean { color: #d73a49; }
+        .null { color: #6f42c1; }
+        .key { color: #24292e; font-weight: 600; }
+        .error { color: #dc3545; background: #f8d7da; padding: 10px; border-radius: 4px; }
+
+        .actions {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        /* Toast Notification */
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #333;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+
+        .toast.show {
+            opacity: 1;
+            visibility: visible;
+            top: 40px;
+        }
+
+        .toast.success {
+            background: #28a745;
+        }
+
+        .toast.error {
+            background: #dc3545;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔧 JSON 格式化工具</h1>
+            <p>美化、压缩、验证 JSON 数据</p>
+        </div>
+        <div class="main">
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">📥 输入 JSON</span>
+                </div>
+                <textarea id="input" placeholder='在这里粘贴或输入 JSON，例如：
+{
+  "name": "张三",
+  "age": 25,
+  "hobbies": ["阅读", "编程", "旅行"]
+}'></textarea>
+            </div>
+            <div class="controls">
+                <button class="btn-format" onclick="formatJSON()">✨ 格式化</button>
+                <button class="btn-minify" onclick="minifyJSON()">📦 压缩</button>
+                <div class="options">
+                    <label class="option">
+                        缩进:
+                        <input type="number" id="indentSize" value="2" min="0" max="10">
+                    </label>
+                </div>
+                <div class="actions">
+                    <button class="btn-copy" onclick="copyResult()">📋 复制结果</button>
+                    <button class="btn-clear" onclick="clearAll()">🗑️ 清空</button>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">
+                    <span class="panel-title">📤 格式化结果</span>
+                </div>
+                <div id="output" class="output-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast"></div>
+
+    <script>
+        const input = document.getElementById('input');
+        const output = document.getElementById('output');
+        const indentSizeInput = document.getElementById('indentSize');
+
+        function formatJSON() {
+            try {
+                const json = input.value.trim();
+                if (!json) {
+                    output.innerHTML = '<div class="error">请输入 JSON 数据</div>';
+                    return;
+                }
+
+                const parsed = JSON.parse(json);
+                const indent = parseInt(indentSizeInput.value) || 2;
+                const formatted = JSON.stringify(parsed, null, indent);
+                output.innerHTML = syntaxHighlight(formatted);
+            } catch (e) {
+                output.innerHTML = `<div class="error">❌ JSON 格式错误: ${e.message}</div>`;
+            }
+        }
+
+        function minifyJSON() {
+            try {
+                const json = input.value.trim();
+                if (!json) {
+                    output.innerHTML = '<div class="error">请输入 JSON 数据</div>';
+                    return;
+                }
+
+                const parsed = JSON.parse(json);
+                const minified = JSON.stringify(parsed);
+                output.innerHTML = syntaxHighlight(minified);
+            } catch (e) {
+                output.innerHTML = `<div class="error">❌ JSON 格式错误: ${e.message}</div>`;
+            }
+        }
+
+        function syntaxHighlight(json) {
+            json = json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            
+            return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function (match) {
+                let cls = 'number';
+                if (/^"/.test(match)) {
+                    if (/:$/.test(match)) {
+                        cls = 'key';
+                    } else {
+                        cls = 'string';
+                    }
+                } else if (/true|false/.test(match)) {
+                    cls = 'boolean';
+                } else if (/null/.test(match)) {
+                    cls = 'null';
+                }
+                return '<span class="' + cls + '">' + match + '</span>';
+            });
+        }
+
+        function copyResult() {
+            const text = output.innerText;
+            if (!text || output.querySelector('.error')) {
+                showToast('没有可复制的内容', 'error');
+                return;
+            }
+            navigator.clipboard.writeText(text).then(() => {
+                showToast('已复制到剪贴板！', 'success');
+            }).catch(() => {
+                showToast('复制失败，请手动复制', 'error');
+            });
+        }
+
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast show';
+            
+            if (type === 'success') {
+                toast.classList.add('success');
+            } else if (type === 'error') {
+                toast.classList.add('error');
+            }
+
+            setTimeout(() => {
+                toast.className = 'toast';
+            }, 2000);
+        }
+
+        function clearAll() {
+            input.value = '';
+            output.innerHTML = '';
+        }
+
+        // 自动格式化示例
+        window.onload = function() {
+            const example = {
+                "项目名称": "JSON格式化工具",
+                "版本": "1.0.0",
+                "功能": ["格式化", "压缩", "语法高亮"],
+                "使用方法": "粘贴JSON并点击格式化按钮"
+            };
+            input.value = JSON.stringify(example, null, 2);
+            formatJSON();
+        };
+    </script>
+</body>
+</html>
