@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import type { HappyCodeConfig } from './config.js';
 import { getModePrompt, type AgentMode } from './modes.js';
-import { TOOL_SCHEMA, runTool, type ToolCall } from './tools.js';
+import { TOOL_SCHEMA, runTool, USER_QUESTION_PREFIX, type ToolCall } from './tools.js';
 import type { McpToolDescriptor } from './mcp_client.js';
 
 export type ChatMessage = {
@@ -22,6 +22,7 @@ export type AgentOptions = {
   appendSystemPrompt?: string;
   mcpTools?: McpToolDescriptor[];
   mcpCall?: (fullName: string, args: Record<string, unknown>) => Promise<string>;
+  onUserQuestion?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
 };
 
 export type ToolEvent = {
@@ -31,6 +32,7 @@ export type ToolEvent = {
   args: Record<string, unknown>;
   ok?: boolean;
   preview?: string;
+  questionPayload?: Record<string, unknown>;
 };
 
 const BASE_PROMPT =
@@ -214,13 +216,50 @@ export class HappyCodeAgent {
           );
         }
 
+        let questionPayload: Record<string, unknown> | undefined;
+        if (toolName === 'user_question' && result.startsWith(USER_QUESTION_PREFIX)) {
+          const raw = result.slice(USER_QUESTION_PREFIX.length);
+          try {
+            questionPayload = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            questionPayload = undefined;
+          }
+
+          if (questionPayload && options.onUserQuestion) {
+            try {
+              const answer = await options.onUserQuestion(questionPayload);
+              result = JSON.stringify(
+                {
+                  kind: 'user_question_answer',
+                  answer
+                },
+                null,
+                2
+              );
+            } catch (err) {
+              result = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          } else if (questionPayload) {
+            result = JSON.stringify(
+              {
+                kind: 'user_question_required',
+                message: 'User decision required in interactive mode.',
+                question: questionPayload
+              },
+              null,
+              2
+            );
+          }
+        }
+
         onToolEvent?.({
           source: 'model',
           phase: 'end',
           name: toolName,
           args: toolArgs,
           ok: !result.startsWith('Denied') && !result.startsWith('Tool error'),
-          preview: result.slice(0, 180)
+          preview: result.slice(0, 180),
+          questionPayload
         });
 
         running.push({

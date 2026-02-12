@@ -13,7 +13,7 @@ import {
   readRecentAudit,
   writeConfig,
   writeDefaultPolicy
-} from "./chunk-66D6A6LD.js";
+} from "./chunk-QKBHKYFE.js";
 
 // src/cli.ts
 import React2 from "react";
@@ -544,14 +544,14 @@ var COMMANDS = [
   { cmd: "/plan", complete: "/plan", desc: "Generate implementation plan" },
   { cmd: "/test [command]", complete: "/test", desc: "Run tests via tools" },
   { cmd: "/fix", complete: "/fix", desc: "Investigate and fix issues" },
-  { cmd: "/mode ask|plan|edit|auto", complete: "/mode ", desc: "Switch mode" },
+  { cmd: "/mode plan|edit|auto", complete: "/mode ", desc: "Switch mode" },
   { cmd: "/theme", complete: "/theme ", desc: "Get or set UI theme" },
   { cmd: "/model [name]", complete: "/model ", desc: "Get or set model" },
   { cmd: "/permissions", complete: "/permissions", desc: "Show tool permission config" },
   { cmd: "/permissions allow <tool>", complete: "/permissions allow ", desc: "Allow specific tool" },
   { cmd: "/permissions deny <tool>", complete: "/permissions deny ", desc: "Deny specific tool" },
   { cmd: "/permissions clear", complete: "/permissions clear", desc: "Clear tool restrictions" },
-  { cmd: "/resume [sessionId]", complete: "/resume ", desc: "Switch session" },
+  { cmd: "/resume [sessionId]", complete: "/resume ", desc: "Open session picker (\u2191/\u2193 + Enter)" },
   { cmd: "/rewind <n>", complete: "/rewind ", desc: "Drop last N messages" },
   { cmd: "/rename <name>", complete: "/rename ", desc: "Rename current session" },
   { cmd: "/export [path]", complete: "/export ", desc: "Export transcript" },
@@ -580,6 +580,7 @@ var COMMANDS = [
   { cmd: "/exit", complete: "/exit", desc: "Quit" }
 ];
 var HELP_TEXT = COMMANDS.map((item) => `${item.cmd.padEnd(34, " ")} ${item.desc}`).join("\n");
+var MODE_CYCLE = ["plan", "edit", "auto"];
 var MAX_RENDER_FLOW_ITEMS = 120;
 var MAX_TOOL_EVENTS_STORE = 2e3;
 var MAX_PREVIEW_LINES = 5;
@@ -669,6 +670,9 @@ function getInlineParamPlaceholder(input) {
   }
   return getCommandParamHint(matched);
 }
+function countUserTurns(messages) {
+  return messages.filter((item) => item.role === "user").length;
+}
 function pushAssistant(text, setHistory, onHistoryChange) {
   setHistory((prev) => {
     const assistantMessage = { role: "assistant", content: text };
@@ -721,6 +725,14 @@ function App({
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
   const [error, setError] = useState(null);
+  const [resumePickerOpen, setResumePickerOpen] = useState(false);
+  const [resumeCandidates, setResumeCandidates] = useState([]);
+  const [resumeCursor, setResumeCursor] = useState(0);
+  const [pendingUserQuestion, setPendingUserQuestion] = useState(null);
+  const [questionFocus, setQuestionFocus] = useState("option");
+  const [selectedTypeIndex, setSelectedTypeIndex] = useState(0);
+  const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
+  const pendingQuestionResolveRef = useRef(null);
   const toolSeqRef = useRef(0);
   const toolTurnRef = useRef(0);
   const toolEventsHydratedRef = useRef(false);
@@ -730,6 +742,38 @@ function App({
   const projectName = useMemo(() => path4.basename(process.cwd()), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
   const flowSeparator = useMemo(() => "-".repeat(contentWidth), [contentWidth]);
+  const shiftMode = useCallback(() => {
+    setRuntime((prev) => {
+      const currentIdx = MODE_CYCLE.indexOf(prev.mode);
+      const nextMode = MODE_CYCLE[(currentIdx + 1 + MODE_CYCLE.length) % MODE_CYCLE.length] ?? MODE_CYCLE[0];
+      pushAssistant(`Switched mode to: ${nextMode}`, setHistory, onHistoryChange);
+      return { ...prev, mode: nextMode };
+    });
+  }, [onHistoryChange]);
+  const closeUserQuestion = useCallback(() => {
+    setPendingUserQuestion(null);
+    setQuestionFocus("option");
+    setSelectedTypeIndex(0);
+    setSelectedOptionIndex(0);
+  }, []);
+  const confirmUserQuestion = useCallback(() => {
+    if (!pendingUserQuestion || !pendingQuestionResolveRef.current) {
+      return;
+    }
+    const type = pendingUserQuestion.types[selectedTypeIndex] ?? pendingUserQuestion.types[0] ?? "single_choice";
+    const option = pendingUserQuestion.options[selectedOptionIndex] ?? pendingUserQuestion.options[0];
+    const answer = {
+      type,
+      optionId: option?.id ?? "",
+      optionLabel: option?.label ?? "",
+      question: pendingUserQuestion.question,
+      title: pendingUserQuestion.title
+    };
+    const resolver = pendingQuestionResolveRef.current;
+    pendingQuestionResolveRef.current = null;
+    closeUserQuestion();
+    resolver(answer);
+  }, [closeUserQuestion, pendingUserQuestion, selectedOptionIndex, selectedTypeIndex]);
   useEffect(() => {
     const handleResize = () => {
       setTerminalColumns(stdout.columns ?? 80);
@@ -750,7 +794,7 @@ function App({
   );
   useEffect(() => {
     const persisted = loadSessionToolEvents();
-    const existingUserTurns = history.filter((item) => item.role === "user").length;
+    const existingUserTurns = countUserTurns(history);
     const normalized = persisted.filter((item) => item.turn <= existingUserTurns);
     setToolEvents(normalized);
     if (normalized.length > 0) {
@@ -760,6 +804,13 @@ function App({
       toolTurnRef.current = maxTurn;
     }
     toolEventsHydratedRef.current = true;
+  }, []);
+  useEffect(() => {
+    if (!toolEventsHydratedRef.current) {
+      return;
+    }
+    const existingUserTurns = countUserTurns(history);
+    setToolEvents((prev) => prev.filter((item) => item.turn <= existingUserTurns));
   }, [history]);
   useEffect(() => {
     if (!toolEventsHydratedRef.current) {
@@ -771,13 +822,44 @@ function App({
     setInput(value);
     setInputKey((prev) => prev + 1);
   }, []);
+  const applySwitchedSession = useCallback(
+    (switched) => {
+      setHistory(switched.messages);
+      const switchedEvents = switched.toolEvents ?? [];
+      setToolEvents(switchedEvents);
+      toolSeqRef.current = switchedEvents.reduce((max, item) => item.seq > max ? item.seq : max, 0);
+      toolTurnRef.current = switchedEvents.reduce((max, item) => item.turn > max ? item.turn : max, 0);
+      onHistoryChange?.(switched.messages);
+    },
+    [onHistoryChange]
+  );
+  const closeResumePicker = useCallback(() => {
+    setResumePickerOpen(false);
+    setResumeCandidates([]);
+    setResumeCursor(0);
+  }, []);
+  const confirmResumeSelection = useCallback(() => {
+    const selected = resumeCandidates[resumeCursor];
+    if (!selected) {
+      return;
+    }
+    const switched = switchSession(selected.id, process.cwd());
+    if (!switched) {
+      setError(`Session not found: ${selected.id}`);
+      closeResumePicker();
+      return;
+    }
+    applySwitchedSession(switched);
+    closeResumePicker();
+    pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
+  }, [applySwitchedSession, closeResumePicker, onHistoryChange, resumeCandidates, resumeCursor]);
   const inputSuggestions = useMemo(() => {
     const trimmed = input.trim();
     if (!trimmed.startsWith("/")) {
       return [];
     }
     const optionSuggestions = [
-      ...buildOptionSuggestions(input, "/mode ", ["ask", "plan", "edit", "auto"], "Select mode"),
+      ...buildOptionSuggestions(input, "/mode ", ["plan", "edit", "auto"], "Select mode"),
       ...buildOptionSuggestions(input, "/theme ", ["black-yellow", "cyber", "minimal"], "Select theme"),
       ...buildOptionSuggestions(
         input,
@@ -813,8 +895,67 @@ function App({
     });
   }, [inputSuggestions]);
   useInput((inputKey2, key) => {
+    if (pendingUserQuestion) {
+      if (key.escape) {
+        closeUserQuestion();
+        setError(null);
+        return;
+      }
+      if (key.tab) {
+        setQuestionFocus((prev) => prev === "type" ? "option" : "type");
+        return;
+      }
+      if (questionFocus === "type" && pendingUserQuestion.types.length > 0) {
+        if (key.upArrow) {
+          setSelectedTypeIndex((prev) => (prev - 1 + pendingUserQuestion.types.length) % pendingUserQuestion.types.length);
+          return;
+        }
+        if (key.downArrow) {
+          setSelectedTypeIndex((prev) => (prev + 1) % pendingUserQuestion.types.length);
+          return;
+        }
+      }
+      if (questionFocus === "option" && pendingUserQuestion.options.length > 0) {
+        if (key.upArrow) {
+          setSelectedOptionIndex((prev) => (prev - 1 + pendingUserQuestion.options.length) % pendingUserQuestion.options.length);
+          return;
+        }
+        if (key.downArrow) {
+          setSelectedOptionIndex((prev) => (prev + 1) % pendingUserQuestion.options.length);
+          return;
+        }
+      }
+      if (key.return) {
+        confirmUserQuestion();
+        return;
+      }
+      return;
+    }
+    if (resumePickerOpen) {
+      if (key.escape) {
+        closeResumePicker();
+        setError(null);
+        return;
+      }
+      if (resumeCandidates.length === 0) {
+        return;
+      }
+      if (key.upArrow) {
+        setResumeCursor((prev) => (prev - 1 + resumeCandidates.length) % resumeCandidates.length);
+        return;
+      }
+      if (key.downArrow) {
+        setResumeCursor((prev) => (prev + 1) % resumeCandidates.length);
+        return;
+      }
+    }
     if (key.escape) {
       setInputAtEnd("");
+      setError(null);
+      return;
+    }
+    if (key.tab && key.shift) {
+      shiftMode();
       setError(null);
       return;
     }
@@ -895,7 +1036,31 @@ Referenced files content:${inline}`;
             systemPrompt: runtime.systemPrompt,
             appendSystemPrompt: runtime.appendSystemPrompt,
             mcpTools,
-            mcpCall: mcpManager ? (fullName, args) => mcpManager.callTool(fullName, args) : void 0
+            mcpCall: mcpManager ? (fullName, args) => mcpManager.callTool(fullName, args) : void 0,
+            onUserQuestion: (payload) => new Promise((resolve) => {
+              const parsed = {
+                title: typeof payload.title === "string" ? payload.title : "Need your decision",
+                question: typeof payload.question === "string" ? payload.question : "Please choose an option.",
+                types: Array.isArray(payload.types) ? payload.types.filter((item) => typeof item === "string" && item.trim().length > 0) : ["single_choice"],
+                options: Array.isArray(payload.options) ? payload.options.filter((item) => typeof item === "object" && item !== null).map((item, index) => ({
+                  id: typeof item.id === "string" && item.id.trim() ? item.id : `option_${index + 1}`,
+                  label: typeof item.label === "string" && item.label.trim() ? item.label : `Option ${index + 1}`,
+                  description: typeof item.description === "string" ? item.description : ""
+                })) : [
+                  { id: "option_1", label: "Proceed with default", description: "Use default path." },
+                  { id: "option_2", label: "Need clarification", description: "Ask user for more detail." }
+                ],
+                defaultType: typeof payload.defaultType === "string" ? payload.defaultType : "",
+                defaultOptionId: typeof payload.defaultOptionId === "string" ? payload.defaultOptionId : ""
+              };
+              const typeIndex = Math.max(0, parsed.types.findIndex((item) => item === parsed.defaultType));
+              const optionIndex = Math.max(0, parsed.options.findIndex((item) => item.id === parsed.defaultOptionId));
+              setQuestionFocus("option");
+              setSelectedTypeIndex(typeIndex);
+              setSelectedOptionIndex(optionIndex);
+              setPendingUserQuestion(parsed);
+              pendingQuestionResolveRef.current = resolve;
+            })
           },
           (delta) => {
             streamingBufferRef.current += delta;
@@ -930,6 +1095,8 @@ Referenced files content:${inline}`;
         setStreaming("");
         streamingBufferRef.current = "";
       } catch (err) {
+        pendingQuestionResolveRef.current = null;
+        closeUserQuestion();
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         if (streamingFlushTimerRef.current) {
@@ -1061,7 +1228,7 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       if (content === "/review") {
         void runAgentTask(
           "Please review the current repository changes. Use git_status and git_diff tools first, then provide: summary, potential bugs, security risks, and actionable fixes.",
-          "ask"
+          "plan"
         );
         return true;
       }
@@ -1086,11 +1253,11 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         return true;
       }
       if (content === "/tasks") {
-        void runAgentTask("List pending implementation tasks with priorities and next action.", "ask");
+        void runAgentTask("List pending implementation tasks with priorities and next action.", "plan");
         return true;
       }
       if (content === "/todos") {
-        void runAgentTask("Generate concise TODO checklist using markdown task items.", "ask");
+        void runAgentTask("Generate concise TODO checklist using markdown task items.", "plan");
         return true;
       }
       if (content === "/copy") {
@@ -1187,7 +1354,7 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
               },
               {
                 name: "reviewer",
-                mode: "ask",
+                mode: "plan",
                 prompt: "Review the proposed approach and list potential issues."
               }
             ],
@@ -1260,8 +1427,16 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         return true;
       }
       if (content === "/resume") {
-        const sessions = listSessions(process.cwd()).slice(0, 10).map((item) => `${item.id} ${item.name} (${item.updatedAt})`);
-        pushAssistant(sessions.length ? sessions.join("\n") : "No sessions available.", setHistory, onHistoryChange);
+        const sessions = listSessions(process.cwd());
+        if (sessions.length === 0) {
+          pushAssistant("No sessions available.", setHistory, onHistoryChange);
+          return true;
+        }
+        setResumeCandidates(sessions);
+        setResumeCursor(0);
+        setResumePickerOpen(true);
+        setError(null);
+        setInput("");
         return true;
       }
       if (content.startsWith("/resume ")) {
@@ -1271,12 +1446,8 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
           pushAssistant(`Session not found: ${id}`, setHistory, onHistoryChange);
           return true;
         }
-        setHistory(switched.messages);
-        const switchedEvents = switched.toolEvents ?? [];
-        setToolEvents(switchedEvents);
-        toolSeqRef.current = switchedEvents.reduce((max, item) => item.seq > max ? item.seq : max, 0);
-        toolTurnRef.current = switchedEvents.reduce((max, item) => item.turn > max ? item.turn : max, 0);
-        onHistoryChange?.(switched.messages);
+        applySwitchedSession(switched);
+        closeResumePicker();
         pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
         return true;
       }
@@ -1284,6 +1455,7 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         const n = Number.parseInt(content.replace("/rewind ", "").trim(), 10);
         const rewound = rewindActiveSession(Number.isFinite(n) ? n : 1, process.cwd());
         setHistory(rewound.messages);
+        setToolEvents(rewound.toolEvents ?? []);
         onHistoryChange?.(rewound.messages);
         pushAssistant(`Rewound session by ${Number.isFinite(n) ? n : 1} messages.`, setHistory, onHistoryChange);
         return true;
@@ -1348,6 +1520,8 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
     },
     [
       inputSuggestions,
+      applySwitchedSession,
+      closeResumePicker,
       enableAudit,
       history,
       onHistoryChange,
@@ -1356,6 +1530,14 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
     ]
   );
   const submit = useCallback(async () => {
+    if (pendingUserQuestion) {
+      confirmUserQuestion();
+      return;
+    }
+    if (resumePickerOpen) {
+      confirmResumeSelection();
+      return;
+    }
     const content = input.trim();
     if (!content || loading) {
       return;
@@ -1410,9 +1592,24 @@ Use /help`, setHistory, onHistoryChange);
     loading,
     onHistoryChange,
     runAgentTask,
+    confirmResumeSelection,
+    confirmUserQuestion,
     setInputAtEnd,
-    suggestionIndex
+    suggestionIndex,
+    resumePickerOpen,
+    pendingUserQuestion
   ]);
+  const visibleResumeCandidates = useMemo(() => {
+    if (!resumePickerOpen) {
+      return [];
+    }
+    const maxItems = 10;
+    if (resumeCandidates.length <= maxItems) {
+      return resumeCandidates;
+    }
+    const start = Math.max(0, Math.min(resumeCursor - Math.floor(maxItems / 2), resumeCandidates.length - maxItems));
+    return resumeCandidates.slice(start, start + maxItems);
+  }, [resumeCandidates, resumeCursor, resumePickerOpen]);
   const toolTimeline = useMemo(() => {
     return [...toolEvents].sort((a, b) => {
       if (a.ts === b.ts) {
@@ -1520,6 +1717,11 @@ Use /help`, setHistory, onHistoryChange);
         projectName
       ] }),
       /* @__PURE__ */ jsxs(Text, { color: themeStyle.metaColor, children: [
+        "Mode: ",
+        runtime.mode
+      ] }),
+      runtime.mode === "plan" ? /* @__PURE__ */ jsx(Text, { color: "yellow", children: "PLAN MODE ACTIVE" }) : null,
+      /* @__PURE__ */ jsxs(Text, { color: themeStyle.metaColor, children: [
         "Model: ",
         runtime.model ?? "(default)"
       ] }),
@@ -1589,6 +1791,39 @@ Use /help`, setHistory, onHistoryChange);
         " - ",
         item.desc
       ] }, item.label))
+    ] }) : null,
+    pendingUserQuestion ? /* @__PURE__ */ jsxs(Box, { flexDirection: "column", borderStyle: "round", borderColor: "yellow", paddingX: 1, marginTop: 1, width: contentWidth, children: [
+      /* @__PURE__ */ jsx(Text, { color: "yellow", children: "User Question Required" }),
+      /* @__PURE__ */ jsx(Text, { children: pendingUserQuestion.title }),
+      /* @__PURE__ */ jsx(Text, { color: "gray", children: pendingUserQuestion.question }),
+      /* @__PURE__ */ jsxs(Text, { color: questionFocus === "type" ? "cyan" : "white", children: [
+        "Types: ",
+        pendingUserQuestion.types.map((item, idx) => idx === selectedTypeIndex ? `[${item}]` : item).join("  ")
+      ] }),
+      pendingUserQuestion.options.map((item, idx) => /* @__PURE__ */ jsxs(Text, { color: questionFocus === "option" && idx === selectedOptionIndex ? "cyan" : "white", children: [
+        idx === selectedOptionIndex ? ">" : " ",
+        " ",
+        item.label,
+        item.description ? ` - ${item.description}` : ""
+      ] }, item.id)),
+      /* @__PURE__ */ jsx(Text, { color: "gray", children: "Tab switch focus, \u2191/\u2193 choose, Enter confirm" })
+    ] }) : null,
+    resumePickerOpen ? /* @__PURE__ */ jsxs(Box, { marginTop: 1, flexDirection: "column", width: contentWidth, children: [
+      /* @__PURE__ */ jsx(Text, { color: "white", children: "Resume Sessions (\u2191/\u2193 choose, Enter confirm, Esc cancel)" }),
+      visibleResumeCandidates.map((item) => {
+        const selected = resumeCandidates[resumeCursor]?.id === item.id;
+        return /* @__PURE__ */ jsxs(Text, { color: selected ? "cyan" : "white", children: [
+          selected ? ">" : " ",
+          " ",
+          item.name,
+          " [",
+          item.id,
+          "] ",
+          item.updatedAt,
+          " msgs:",
+          item.messages.length
+        ] }, item.id);
+      })
     ] }) : null
   ] });
 }
@@ -1619,9 +1854,6 @@ program.command("run").description("Start TUI").option("--mode <mode>", `Default
 `);
     process.exit(1);
   }
-  if (options.new) {
-    createSession(typeof options.new === "string" ? options.new : "new", process.cwd());
-  }
   if (options.resume) {
     const restored = switchSession(String(options.resume), process.cwd());
     if (!restored) {
@@ -1629,6 +1861,9 @@ program.command("run").description("Start TUI").option("--mode <mode>", `Default
 `);
       process.exit(1);
     }
+  } else {
+    const nextName = typeof options.new === "string" ? options.new : "new";
+    createSession(nextName, process.cwd());
   }
   const agent = new HappyCodeAgent(cfg);
   const mcpManager = new McpClientManager();
@@ -1661,7 +1896,7 @@ program.command("run").description("Start TUI").option("--mode <mode>", `Default
     })
   );
 });
-program.command("chat").description("Single-turn non-interactive chat").requiredOption("-m, --message <text>", "User message").option("--mode <mode>", `Mode: ${SUPPORTED_MODES.join("|")}`, "ask").option("--model <name>", "Override model").option("--fallback-model <name>", "Fallback model on failure").option("--max-turns <n>", "Max tool turns", "8").option("--allowed-tools <csv>", "Comma separated allowed tools").option("--disallowed-tools <csv>", "Comma separated disallowed tools").option("--system-prompt <text>", "Override system prompt").option("--append-system-prompt <text>", "Append additional system prompt text").option("--json", "Print JSON output").option("--stream-json", "Stream JSON chunks").option("--no-audit", "Disable tool audit log").action(async (options) => {
+program.command("chat").description("Single-turn non-interactive chat").requiredOption("-m, --message <text>", "User message").option("--mode <mode>", `Mode: ${SUPPORTED_MODES.join("|")}`, "plan").option("--model <name>", "Override model").option("--fallback-model <name>", "Fallback model on failure").option("--max-turns <n>", "Max tool turns", "8").option("--allowed-tools <csv>", "Comma separated allowed tools").option("--disallowed-tools <csv>", "Comma separated disallowed tools").option("--system-prompt <text>", "Override system prompt").option("--append-system-prompt <text>", "Append additional system prompt text").option("--json", "Print JSON output").option("--stream-json", "Stream JSON chunks").option("--no-audit", "Disable tool audit log").action(async (options) => {
   const cfg = readConfig();
   if (!cfg) {
     process.stderr.write(
@@ -1669,7 +1904,7 @@ program.command("chat").description("Single-turn non-interactive chat").required
     );
     process.exit(1);
   }
-  const mode = options.mode ?? "ask";
+  const mode = options.mode ?? "plan";
   if (!SUPPORTED_MODES.includes(mode)) {
     process.stderr.write(`Invalid mode: ${mode}. Allowed: ${SUPPORTED_MODES.join(", ")}
 `);
@@ -1761,7 +1996,7 @@ program.command("agents").description("Run multi-agent orchestration tasks").req
       },
       {
         name: "reviewer",
-        mode: "ask",
+        mode: "plan",
         prompt: "Review the proposed approach and list potential issues."
       }
     ],

@@ -71,7 +71,8 @@ In TUI:
 - `/tasks` and `/todos` for task extraction
 - `/copy` copy latest assistant answer
 - ask coding tasks in natural language
-- `/mode ask|plan|edit|auto` switch runtime mode
+- `/mode plan|edit|auto` switch runtime mode
+- `Shift+Tab` quick-switch mode (`plan -> edit -> auto`)
 - `/audit` show recent tool execution logs
 - `/clear` clears session history
 - `/exit` or `/quit` exits
@@ -137,10 +138,9 @@ Inside TUI:
 
 Mode policy summary:
 
-- `ask`: read-only Q&A
 - `plan`: read-only, produce implementation plan first
 - `edit`: allow file editing tools
-- `auto`: allow file editing + shell execution tools
+- `auto`: allow file editing + shell execution tools (no approval/safety gating)
 
 ## Session persistence
 
@@ -165,14 +165,15 @@ By default, session is stored at:
 - `git_status`
 - `git_diff`
 - `git_log`
+- `user_question`
 
 ## Production safety
 
-- Shell execution is validated by a safety policy (dangerous patterns blocked)
+- Shell execution is validated by safety policy outside `auto`
 - Mode policy gates write/exec permissions
 - Tool calls are audited to `~/.happycode/audit.log` by default
 - Sensitive path writes can be blocked by `.happycode-policy.json`
-- Shell commands require explicit approval prefix before execution
+- Shell commands may require explicit approval prefix outside `auto`
 
 Audit helpers:
 
@@ -185,14 +186,12 @@ Disable audit:
 
 ```bash
 happycode run --no-audit
-happycode chat -m "status" --mode ask --no-audit
+happycode chat -m "status" --mode plan --no-audit
 ```
 
 ## Command approval flow
 
-When shell execution is requested, the tool may reply with:
-
-`Approval required. Run in TUI: /allow once <command> or /allow session <command>`
+When shell execution is requested outside `auto`, it may require explicit approval in TUI.
 
 TUI commands:
 

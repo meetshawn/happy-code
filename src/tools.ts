@@ -34,7 +34,10 @@ export type ToolCall =
   | { name: 'run_shell'; args?: JsonObject }
   | { name: 'git_status'; args?: JsonObject }
   | { name: 'git_diff'; args?: JsonObject }
-  | { name: 'git_log'; args?: JsonObject };
+  | { name: 'git_log'; args?: JsonObject }
+  | { name: 'user_question'; args?: JsonObject };
+
+export const USER_QUESTION_PREFIX = 'NEEDS_USER_QUESTION::';
 
 function resolveInCwd(cwd: string, inputPath: string): string {
   const resolved = path.resolve(cwd, inputPath);
@@ -92,7 +95,10 @@ function readFile(cwd: string, filePath: string): string {
   return clampOutput(content, MAX_READ);
 }
 
-function assertWritable(cwd: string, filePath: string): void {
+function assertWritable(cwd: string, filePath: string, mode: AgentMode): void {
+  if (mode === 'auto') {
+    return;
+  }
   const fullPath = resolveInCwd(cwd, filePath);
   const rel = toRelative(cwd, fullPath);
   const policy = loadPolicy(cwd);
@@ -101,24 +107,24 @@ function assertWritable(cwd: string, filePath: string): void {
   }
 }
 
-function writeFile(cwd: string, filePath: string, content: string): string {
-  assertWritable(cwd, filePath);
+function writeFile(cwd: string, filePath: string, content: string, mode: AgentMode): string {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   fs.mkdirSync(path.dirname(fullPath), { recursive: true });
   fs.writeFileSync(fullPath, content, 'utf8');
   return `Wrote ${filePath}`;
 }
 
-function appendFile(cwd: string, filePath: string, content: string): string {
-  assertWritable(cwd, filePath);
+function appendFile(cwd: string, filePath: string, content: string, mode: AgentMode): string {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   fs.mkdirSync(path.dirname(fullPath), { recursive: true });
   fs.appendFileSync(fullPath, content, 'utf8');
   return `Appended ${filePath}`;
 }
 
-function patchFile(cwd: string, filePath: string, findText: string, replaceText: string): string {
-  assertWritable(cwd, filePath);
+function patchFile(cwd: string, filePath: string, findText: string, replaceText: string, mode: AgentMode): string {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   const source = fs.readFileSync(fullPath, 'utf8');
   if (!source.includes(findText)) {
@@ -129,8 +135,8 @@ function patchFile(cwd: string, filePath: string, findText: string, replaceText:
   return `Patched ${filePath}`;
 }
 
-function deleteFile(cwd: string, filePath: string): string {
-  assertWritable(cwd, filePath);
+function deleteFile(cwd: string, filePath: string, mode: AgentMode): string {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   if (!fs.existsSync(fullPath)) {
     return `File does not exist: ${filePath}`;
@@ -228,21 +234,22 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
         output = readFile(context.cwd, stringArg(call.args, 'path'));
         break;
       case 'write_file':
-        output = writeFile(context.cwd, stringArg(call.args, 'path'), stringArg(call.args, 'content'));
+        output = writeFile(context.cwd, stringArg(call.args, 'path'), stringArg(call.args, 'content'), context.mode);
         break;
       case 'append_file':
-        output = appendFile(context.cwd, stringArg(call.args, 'path'), stringArg(call.args, 'content'));
+        output = appendFile(context.cwd, stringArg(call.args, 'path'), stringArg(call.args, 'content'), context.mode);
         break;
       case 'patch_file':
         output = patchFile(
           context.cwd,
           stringArg(call.args, 'path'),
           stringArg(call.args, 'find'),
-          stringArg(call.args, 'replace')
+          stringArg(call.args, 'replace'),
+          context.mode
         );
         break;
       case 'delete_file':
-        output = deleteFile(context.cwd, stringArg(call.args, 'path'));
+        output = deleteFile(context.cwd, stringArg(call.args, 'path'), context.mode);
         break;
       case 'search_in_files':
         output = searchInFiles(
@@ -253,16 +260,18 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
         break;
       case 'run_shell': {
         const command = stringArg(call.args, 'command');
-        const check = validateShellCommand(command, runtimePolicy);
-        if (!check.ok) {
-          output = `Denied by security policy: ${check.reason ?? 'unsafe command.'}`;
-          audit(context, call, false, output);
-          return output;
-        }
-        if (needsCommandApproval(command)) {
-          output = `Approval required. Run in TUI: /allow once ${command} or /allow session ${command}`;
-          audit(context, call, false, output);
-          return output;
+        if (context.mode !== 'auto') {
+          const check = validateShellCommand(command, runtimePolicy);
+          if (!check.ok) {
+            output = `Denied by security policy: ${check.reason ?? 'unsafe command.'}`;
+            audit(context, call, false, output);
+            return output;
+          }
+          if (needsCommandApproval(command)) {
+            output = `Approval required. Run in TUI: /allow once ${command} or /allow session ${command}`;
+            audit(context, call, false, output);
+            return output;
+          }
         }
         output = await runCommand(context.cwd, command, numberArg(call.args, 'timeout_ms', 30_000));
         break;
@@ -279,6 +288,31 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
       case 'git_log': {
         const count = Math.max(1, Math.min(50, numberArg(call.args, 'count', 10)));
         output = await runCommand(context.cwd, `git log --oneline -n ${count}`);
+        break;
+      }
+      case 'user_question': {
+        const payload = {
+          title: stringArg(call.args, 'title', 'Need your decision'),
+          question: stringArg(call.args, 'question', 'Please choose an option.'),
+          types: Array.isArray(call.args?.types)
+            ? (call.args?.types as unknown[]).filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+            : ['single_choice'],
+          options: Array.isArray(call.args?.options)
+            ? (call.args?.options as unknown[])
+                .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+                .map((item, index) => ({
+                  id: typeof item.id === 'string' && item.id.trim() ? item.id : `option_${index + 1}`,
+                  label: typeof item.label === 'string' && item.label.trim() ? item.label : `Option ${index + 1}`,
+                  description: typeof item.description === 'string' ? item.description : ''
+                }))
+            : [
+                { id: 'option_1', label: 'Proceed with default', description: 'Use the default implementation path.' },
+                { id: 'option_2', label: 'Ask for clarification', description: 'Request more detail before implementation.' }
+              ],
+          defaultType: stringArg(call.args, 'defaultType', ''),
+          defaultOptionId: stringArg(call.args, 'defaultOptionId', '')
+        };
+        output = `${USER_QUESTION_PREFIX}${JSON.stringify(payload)}`;
         break;
       }
       default:
@@ -405,6 +439,39 @@ export const TOOL_SCHEMA = [
         properties: {
           command: { type: 'string' },
           timeout_ms: { type: 'number' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'user_question',
+      description: 'Request explicit user decision when uncertain. Use concise options.',
+      parameters: {
+        type: 'object',
+        required: ['title', 'question', 'options'],
+        properties: {
+          title: { type: 'string' },
+          question: { type: 'string' },
+          types: {
+            type: 'array',
+            items: { type: 'string' }
+          },
+          options: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['id', 'label'],
+              properties: {
+                id: { type: 'string' },
+                label: { type: 'string' },
+                description: { type: 'string' }
+              }
+            }
+          },
+          defaultType: { type: 'string' },
+          defaultOptionId: { type: 'string' }
         }
       }
     }

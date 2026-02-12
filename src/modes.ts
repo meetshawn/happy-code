@@ -1,4 +1,4 @@
-export type AgentMode = 'ask' | 'plan' | 'edit' | 'auto';
+export type AgentMode = 'plan' | 'edit' | 'auto';
 
 export type ModePolicy = {
   allowWrite: boolean;
@@ -7,8 +7,6 @@ export type ModePolicy = {
 
 export function getModePolicy(mode: AgentMode): ModePolicy {
   switch (mode) {
-    case 'ask':
-      return { allowWrite: false, allowExec: false };
     case 'plan':
       return { allowWrite: false, allowExec: false };
     case 'edit':
@@ -22,18 +20,21 @@ export function getModePolicy(mode: AgentMode): ModePolicy {
 
 export function getModePrompt(mode: AgentMode): string {
   switch (mode) {
-    case 'ask':
-      return 'Mode=ask. Answer coding questions, inspect files, do not modify files, do not run shell commands.';
     case 'plan':
-      return 'Mode=plan. First produce an explicit implementation plan. You may inspect files, but do not modify files or run shell commands.';
+      return [
+        'Mode=plan.',
+        'You must produce an explicit, ordered implementation plan before execution.',
+        'Include goals, constraints, milestones, risks, validation strategy, and rollback/alternative options.',
+        'If key details are missing or uncertain, call user_question to request a decision instead of guessing.',
+        'You may inspect files, but do not modify files or run shell commands.'
+      ].join(' ');
     case 'edit':
-      return 'Mode=edit. You may inspect and edit project files to complete tasks. Do not run shell commands.';
+      return 'Mode=edit. You may inspect and edit project files to complete tasks. Do not run shell commands. If uncertain, call user_question for explicit user choice.';
     case 'auto':
-      return 'Mode=auto. You may inspect/edit files and run safe shell commands when required.';
+      return 'Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice.';
     default:
-      return 'Mode=ask. Read-only coding assistant behavior.';
+      return 'Mode=plan. Produce a clear implementation plan first.';
   }
 }
 
-export const SUPPORTED_MODES: AgentMode[] = ['ask', 'plan', 'edit', 'auto'];
-
+export const SUPPORTED_MODES: AgentMode[] = ['plan', 'edit', 'auto'];

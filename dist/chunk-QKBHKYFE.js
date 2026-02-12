@@ -1,8 +1,6 @@
 // src/modes.ts
 function getModePolicy(mode) {
   switch (mode) {
-    case "ask":
-      return { allowWrite: false, allowExec: false };
     case "plan":
       return { allowWrite: false, allowExec: false };
     case "edit":
@@ -15,19 +13,23 @@ function getModePolicy(mode) {
 }
 function getModePrompt(mode) {
   switch (mode) {
-    case "ask":
-      return "Mode=ask. Answer coding questions, inspect files, do not modify files, do not run shell commands.";
     case "plan":
-      return "Mode=plan. First produce an explicit implementation plan. You may inspect files, but do not modify files or run shell commands.";
+      return [
+        "Mode=plan.",
+        "You must produce an explicit, ordered implementation plan before execution.",
+        "Include goals, constraints, milestones, risks, validation strategy, and rollback/alternative options.",
+        "If key details are missing or uncertain, call user_question to request a decision instead of guessing.",
+        "You may inspect files, but do not modify files or run shell commands."
+      ].join(" ");
     case "edit":
-      return "Mode=edit. You may inspect and edit project files to complete tasks. Do not run shell commands.";
+      return "Mode=edit. You may inspect and edit project files to complete tasks. Do not run shell commands. If uncertain, call user_question for explicit user choice.";
     case "auto":
-      return "Mode=auto. You may inspect/edit files and run safe shell commands when required.";
+      return "Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice.";
     default:
-      return "Mode=ask. Read-only coding assistant behavior.";
+      return "Mode=plan. Produce a clear implementation plan first.";
   }
 }
-var SUPPORTED_MODES = ["ask", "plan", "edit", "auto"];
+var SUPPORTED_MODES = ["plan", "edit", "auto"];
 
 // src/audit.ts
 import fs from "fs";
@@ -240,6 +242,7 @@ function validateShellCommand(command, policy) {
 var execAsync = promisify(exec);
 var MAX_READ = 3e4;
 var MAX_OUTPUT = 2e4;
+var USER_QUESTION_PREFIX = "NEEDS_USER_QUESTION::";
 function resolveInCwd(cwd, inputPath) {
   const resolved = path4.resolve(cwd, inputPath);
   const normalizedCwd = path4.resolve(cwd) + path4.sep;
@@ -290,7 +293,10 @@ function readFile(cwd, filePath) {
   const content = fs4.readFileSync(fullPath, "utf8");
   return clampOutput(content, MAX_READ);
 }
-function assertWritable(cwd, filePath) {
+function assertWritable(cwd, filePath, mode) {
+  if (mode === "auto") {
+    return;
+  }
   const fullPath = resolveInCwd(cwd, filePath);
   const rel = toRelative(cwd, fullPath);
   const policy = loadPolicy(cwd);
@@ -298,22 +304,22 @@ function assertWritable(cwd, filePath) {
     throw new Error(`Path is protected by policy: ${rel}`);
   }
 }
-function writeFile(cwd, filePath, content) {
-  assertWritable(cwd, filePath);
+function writeFile(cwd, filePath, content, mode) {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   fs4.mkdirSync(path4.dirname(fullPath), { recursive: true });
   fs4.writeFileSync(fullPath, content, "utf8");
   return `Wrote ${filePath}`;
 }
-function appendFile(cwd, filePath, content) {
-  assertWritable(cwd, filePath);
+function appendFile(cwd, filePath, content, mode) {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   fs4.mkdirSync(path4.dirname(fullPath), { recursive: true });
   fs4.appendFileSync(fullPath, content, "utf8");
   return `Appended ${filePath}`;
 }
-function patchFile(cwd, filePath, findText, replaceText) {
-  assertWritable(cwd, filePath);
+function patchFile(cwd, filePath, findText, replaceText, mode) {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   const source = fs4.readFileSync(fullPath, "utf8");
   if (!source.includes(findText)) {
@@ -323,8 +329,8 @@ function patchFile(cwd, filePath, findText, replaceText) {
   fs4.writeFileSync(fullPath, next, "utf8");
   return `Patched ${filePath}`;
 }
-function deleteFile(cwd, filePath) {
-  assertWritable(cwd, filePath);
+function deleteFile(cwd, filePath, mode) {
+  assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
   if (!fs4.existsSync(fullPath)) {
     return `File does not exist: ${filePath}`;
@@ -410,21 +416,22 @@ async function runTool(call, context) {
         output = readFile(context.cwd, stringArg(call.args, "path"));
         break;
       case "write_file":
-        output = writeFile(context.cwd, stringArg(call.args, "path"), stringArg(call.args, "content"));
+        output = writeFile(context.cwd, stringArg(call.args, "path"), stringArg(call.args, "content"), context.mode);
         break;
       case "append_file":
-        output = appendFile(context.cwd, stringArg(call.args, "path"), stringArg(call.args, "content"));
+        output = appendFile(context.cwd, stringArg(call.args, "path"), stringArg(call.args, "content"), context.mode);
         break;
       case "patch_file":
         output = patchFile(
           context.cwd,
           stringArg(call.args, "path"),
           stringArg(call.args, "find"),
-          stringArg(call.args, "replace")
+          stringArg(call.args, "replace"),
+          context.mode
         );
         break;
       case "delete_file":
-        output = deleteFile(context.cwd, stringArg(call.args, "path"));
+        output = deleteFile(context.cwd, stringArg(call.args, "path"), context.mode);
         break;
       case "search_in_files":
         output = searchInFiles(
@@ -435,16 +442,18 @@ async function runTool(call, context) {
         break;
       case "run_shell": {
         const command = stringArg(call.args, "command");
-        const check = validateShellCommand(command, runtimePolicy);
-        if (!check.ok) {
-          output = `Denied by security policy: ${check.reason ?? "unsafe command."}`;
-          audit(context, call, false, output);
-          return output;
-        }
-        if (needsCommandApproval(command)) {
-          output = `Approval required. Run in TUI: /allow once ${command} or /allow session ${command}`;
-          audit(context, call, false, output);
-          return output;
+        if (context.mode !== "auto") {
+          const check = validateShellCommand(command, runtimePolicy);
+          if (!check.ok) {
+            output = `Denied by security policy: ${check.reason ?? "unsafe command."}`;
+            audit(context, call, false, output);
+            return output;
+          }
+          if (needsCommandApproval(command)) {
+            output = `Approval required. Run in TUI: /allow once ${command} or /allow session ${command}`;
+            audit(context, call, false, output);
+            return output;
+          }
         }
         output = await runCommand(context.cwd, command, numberArg(call.args, "timeout_ms", 3e4));
         break;
@@ -461,6 +470,25 @@ async function runTool(call, context) {
       case "git_log": {
         const count = Math.max(1, Math.min(50, numberArg(call.args, "count", 10)));
         output = await runCommand(context.cwd, `git log --oneline -n ${count}`);
+        break;
+      }
+      case "user_question": {
+        const payload = {
+          title: stringArg(call.args, "title", "Need your decision"),
+          question: stringArg(call.args, "question", "Please choose an option."),
+          types: Array.isArray(call.args?.types) ? (call.args?.types).filter((item) => typeof item === "string" && item.trim().length > 0) : ["single_choice"],
+          options: Array.isArray(call.args?.options) ? (call.args?.options).filter((item) => typeof item === "object" && item !== null).map((item, index) => ({
+            id: typeof item.id === "string" && item.id.trim() ? item.id : `option_${index + 1}`,
+            label: typeof item.label === "string" && item.label.trim() ? item.label : `Option ${index + 1}`,
+            description: typeof item.description === "string" ? item.description : ""
+          })) : [
+            { id: "option_1", label: "Proceed with default", description: "Use the default implementation path." },
+            { id: "option_2", label: "Ask for clarification", description: "Request more detail before implementation." }
+          ],
+          defaultType: stringArg(call.args, "defaultType", ""),
+          defaultOptionId: stringArg(call.args, "defaultOptionId", "")
+        };
+        output = `${USER_QUESTION_PREFIX}${JSON.stringify(payload)}`;
         break;
       }
       default:
@@ -585,6 +613,39 @@ var TOOL_SCHEMA = [
         properties: {
           command: { type: "string" },
           timeout_ms: { type: "number" }
+        }
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "user_question",
+      description: "Request explicit user decision when uncertain. Use concise options.",
+      parameters: {
+        type: "object",
+        required: ["title", "question", "options"],
+        properties: {
+          title: { type: "string" },
+          question: { type: "string" },
+          types: {
+            type: "array",
+            items: { type: "string" }
+          },
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["id", "label"],
+              properties: {
+                id: { type: "string" },
+                label: { type: "string" },
+                description: { type: "string" }
+              }
+            }
+          },
+          defaultType: { type: "string" },
+          defaultOptionId: { type: "string" }
         }
       }
     }
@@ -765,13 +826,48 @@ var HappyCodeAgent = class {
             }
           );
         }
+        let questionPayload;
+        if (toolName === "user_question" && result.startsWith(USER_QUESTION_PREFIX)) {
+          const raw = result.slice(USER_QUESTION_PREFIX.length);
+          try {
+            questionPayload = JSON.parse(raw);
+          } catch {
+            questionPayload = void 0;
+          }
+          if (questionPayload && options.onUserQuestion) {
+            try {
+              const answer = await options.onUserQuestion(questionPayload);
+              result = JSON.stringify(
+                {
+                  kind: "user_question_answer",
+                  answer
+                },
+                null,
+                2
+              );
+            } catch (err) {
+              result = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          } else if (questionPayload) {
+            result = JSON.stringify(
+              {
+                kind: "user_question_required",
+                message: "User decision required in interactive mode.",
+                question: questionPayload
+              },
+              null,
+              2
+            );
+          }
+        }
         onToolEvent?.({
           source: "model",
           phase: "end",
           name: toolName,
           args: toolArgs,
           ok: !result.startsWith("Denied") && !result.startsWith("Tool error"),
-          preview: result.slice(0, 180)
+          preview: result.slice(0, 180),
+          questionPayload
         });
         running.push({
           role: "tool",

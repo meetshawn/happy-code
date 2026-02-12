@@ -7,7 +7,7 @@ declare function getConfigPath(): string;
 declare function readConfig(): HappyCodeConfig | null;
 declare function writeConfig(config: HappyCodeConfig): void;
 
-type AgentMode = 'ask' | 'plan' | 'edit' | 'auto';
+type AgentMode = 'plan' | 'edit' | 'auto';
 type ModePolicy = {
     allowWrite: boolean;
     allowExec: boolean;
@@ -41,6 +41,7 @@ type AgentOptions = {
     appendSystemPrompt?: string;
     mcpTools?: McpToolDescriptor[];
     mcpCall?: (fullName: string, args: Record<string, unknown>) => Promise<string>;
+    onUserQuestion?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
 };
 type ToolEvent = {
     source: 'model' | 'runtime';
@@ -49,6 +50,7 @@ type ToolEvent = {
     args: Record<string, unknown>;
     ok?: boolean;
     preview?: string;
+    questionPayload?: Record<string, unknown>;
 };
 declare class HappyCodeAgent {
     private client;
