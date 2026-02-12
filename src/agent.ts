@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import type { HappyCodeConfig } from './config.js';
+import { buildRuntimeMemoryPrompt } from './memory.js';
 import { getModePrompt, type AgentMode } from './modes.js';
 import { APPROVAL_REQUIRED_PREFIX, TOOL_SCHEMA, runTool, USER_QUESTION_PREFIX, type ToolCall } from './tools.js';
 import type { McpToolDescriptor } from './mcp_client.js';
@@ -49,14 +50,17 @@ function parseToolArgs(raw: string): Record<string, unknown> {
 function toOpenAIMessages(
   messages: ChatMessage[],
   mode: AgentMode,
+  cwd: string,
   systemPrompt?: string,
   appendSystemPrompt?: string
 ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  const memoryPrompt = buildRuntimeMemoryPrompt(cwd);
+  const mergedAppendPrompt = [appendSystemPrompt ?? '', memoryPrompt].filter(Boolean).join('\n\n');
   const merged = [
     BASE_PROMPT,
     systemPrompt ?? '',
     getModePrompt(mode),
-    appendSystemPrompt ?? ''
+    mergedAppendPrompt
   ]
     .map((item) => item.trim())
     .filter(Boolean)
@@ -119,10 +123,11 @@ export class HappyCodeAgent {
     onDelta?: (chunk: string) => void,
     onToolEvent?: (event: ToolEvent) => void
   ): Promise<string> {
-    const maxTurns = options.maxTurns ?? 8;
+    const maxTurns = options.maxTurns ?? 24;
     const running = toOpenAIMessages(
       messages,
       options.mode,
+      options.cwd,
       options.systemPrompt,
       options.appendSystemPrompt
     );
@@ -232,14 +237,41 @@ export class HappyCodeAgent {
           if (questionPayload && options.onUserQuestion) {
             try {
               const answer = await options.onUserQuestion(questionPayload);
-              result = JSON.stringify(
-                {
-                  kind: 'user_question_answer',
-                  answer
-                },
-                null,
-                2
-              );
+              if (isApprovalQuestion) {
+                const optionId = typeof answer.optionId === 'string' ? answer.optionId : '';
+                const shouldRetry = ['allow_once', 'allow_session', 'allow_global'].includes(optionId);
+                if (shouldRetry) {
+                  result = await runTool(
+                    {
+                      name: toolName as ToolCall['name'],
+                      args: toolArgs
+                    },
+                    {
+                      mode: options.mode,
+                      cwd: options.cwd,
+                      enableAudit: options.enableAudit ?? true
+                    }
+                  );
+                } else {
+                  result = JSON.stringify(
+                    {
+                      kind: 'user_question_answer',
+                      answer
+                    },
+                    null,
+                    2
+                  );
+                }
+              } else {
+                result = JSON.stringify(
+                  {
+                    kind: 'user_question_answer',
+                    answer
+                  },
+                  null,
+                  2
+                );
+              }
             } catch (err) {
               result = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
             }
@@ -274,6 +306,6 @@ export class HappyCodeAgent {
       }
     }
 
-    return 'Stopped after max tool turns. Please refine your request.';
+    return `Stopped after max tool turns (${maxTurns}). Increase --max-turns or split the task into smaller steps.`;
   }
 }

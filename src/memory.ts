@@ -17,7 +17,9 @@ export type MemoryDocument = {
 
 const GLOBAL_MEMORY_PATH = path.join(os.homedir(), '.happycode', 'memory_user.md');
 const LEGACY_MEMORY_PATH = path.join(os.homedir(), '.happycode', 'memory.md');
-const PROJECT_MEMORY_FILE = '.happycode-memory.md';
+const PROJECT_MEMORY_DIR = '.happycode';
+const PROJECT_MEMORY_FILE = 'memory_project.md';
+const LEGACY_PROJECT_MEMORY_FILE = '.happycode-memory.md';
 const MEMORY_PROMPT_MAX_CHARS = 2400;
 
 const SECTION_LABELS: Record<MemorySection, string> = {
@@ -132,7 +134,24 @@ function scopePath(scope: MemoryScope, cwd = process.cwd()): string {
   if (scope === 'user') {
     return GLOBAL_MEMORY_PATH;
   }
-  return path.join(cwd, PROJECT_MEMORY_FILE);
+  return path.join(cwd, PROJECT_MEMORY_DIR, PROJECT_MEMORY_FILE);
+}
+
+function legacyProjectScopePath(cwd = process.cwd()): string {
+  return path.join(cwd, LEGACY_PROJECT_MEMORY_FILE);
+}
+
+function migrateLegacyProjectMemoryIfNeeded(cwd = process.cwd()): void {
+  const currentPath = scopePath('project', cwd);
+  const legacyPath = legacyProjectScopePath(cwd);
+
+  if (fs.existsSync(currentPath) || !fs.existsSync(legacyPath)) {
+    return;
+  }
+
+  const legacyRaw = fs.readFileSync(legacyPath, 'utf8');
+  const migratedDoc = parseMemoryMarkdown(legacyRaw, 'project');
+  writeMemoryDocument('project', migratedDoc, cwd);
 }
 
 function enforceUniqueSection(items: string[]): string[] {
@@ -195,6 +214,9 @@ export function getProjectMemoryPath(cwd = process.cwd()): string {
 }
 
 export function readMemory(scope: MemoryScope = 'user', cwd = process.cwd()): string {
+  if (scope === 'project') {
+    migrateLegacyProjectMemoryIfNeeded(cwd);
+  }
   const target = scopePath(scope, cwd);
   if (!fs.existsSync(target)) {
     return '';
@@ -203,6 +225,9 @@ export function readMemory(scope: MemoryScope = 'user', cwd = process.cwd()): st
 }
 
 export function readMemoryDocument(scope: MemoryScope = 'user', cwd = process.cwd()): MemoryDocument {
+  if (scope === 'project') {
+    migrateLegacyProjectMemoryIfNeeded(cwd);
+  }
   const target = scopePath(scope, cwd);
   if (!fs.existsSync(target)) {
     if (scope === 'user' && fs.existsSync(LEGACY_MEMORY_PATH)) {
@@ -263,9 +288,18 @@ export function clearMemory(scope: MemoryScope = 'user', cwd = process.cwd()): v
   if (fs.existsSync(target)) {
     fs.unlinkSync(target);
   }
+  if (scope === 'project') {
+    const legacyTarget = legacyProjectScopePath(cwd);
+    if (fs.existsSync(legacyTarget)) {
+      fs.unlinkSync(legacyTarget);
+    }
+  }
 }
 
 export function ensureMemoryFile(scope: MemoryScope, cwd = process.cwd()): string {
+  if (scope === 'project') {
+    migrateLegacyProjectMemoryIfNeeded(cwd);
+  }
   const target = scopePath(scope, cwd);
   if (!fs.existsSync(target)) {
     ensureParentDir(target);

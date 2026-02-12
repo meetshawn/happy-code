@@ -1,5 +1,6 @@
 import type { ChatMessage } from './agent.js';
 import type { HappyCodeAgent } from './agent.js';
+import { buildRuntimeMemoryPrompt } from './memory.js';
 import type { AgentMode } from './modes.js';
 
 export type SubAgentTask = {
@@ -30,7 +31,8 @@ export class MultiAgentRuntime {
           mode: task.mode,
           cwd: context.cwd,
           enableAudit: context.enableAudit,
-          maxTurns: context.maxTurns ?? 6
+          maxTurns: context.maxTurns ?? 12,
+          appendSystemPrompt: buildRuntimeMemoryPrompt(context.cwd)
         }
       );
       outputs.push({
@@ -48,4 +50,3 @@ export class MultiAgentRuntime {
       .join('\n\n');
   }
 }
-

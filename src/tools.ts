@@ -196,11 +196,34 @@ function sessionApprovalPrefix(command: string): string {
   return normalizeCommand(command).split(' ').slice(0, 2).join(' ').trim();
 }
 
-function buildApprovalPayload(command: string): string {
+type ShellApprovalReasonCode = 'approval_required' | 'not_allowed_prefix' | 'deny_pattern';
+
+function reasonCodeFromPolicyReason(reason: string): ShellApprovalReasonCode {
+  if (reason.startsWith('Command matches denied pattern:')) {
+    return 'deny_pattern';
+  }
+  if (reason.startsWith('Command not in policy allowShellPrefixes.')) {
+    return 'not_allowed_prefix';
+  }
+  return 'approval_required';
+}
+
+function buildApprovalPayload(
+  command: string,
+  reasonCode: ShellApprovalReasonCode = 'approval_required',
+  policyReason = ''
+): string {
   const normalized = normalizeCommand(command);
+  const prefix = sessionApprovalPrefix(command) || normalized;
+  const reasonLine =
+    reasonCode === 'deny_pattern'
+      ? `High-risk command matched deny pattern. ${policyReason}`
+      : reasonCode === 'not_allowed_prefix'
+        ? `Command prefix is not allowed by policy. ${policyReason}`
+        : 'Command requires explicit approval in current mode.';
   const payload = {
     title: 'Shell approval required',
-    question: `Allow shell command in current mode?\n${command}`,
+    question: `Allow shell command in current mode?\n${command}\n\n${reasonLine.trim()}`,
     types: ['single_choice'],
     options: [
       {
@@ -211,7 +234,12 @@ function buildApprovalPayload(command: string): string {
       {
         id: 'allow_session',
         label: 'Allow session prefix',
-        description: `Allow this command prefix for current session: ${sessionApprovalPrefix(command) || normalized}`
+        description: `Allow this command prefix for current session: ${prefix}`
+      },
+      {
+        id: 'allow_global',
+        label: 'Allow global prefix',
+        description: `Allow this command prefix globally: ${prefix}`
       },
       {
         id: 'deny',
@@ -220,11 +248,13 @@ function buildApprovalPayload(command: string): string {
       }
     ],
     defaultType: 'single_choice',
-    defaultOptionId: 'deny',
+    defaultOptionId: 'allow_once',
     meta: {
       command,
       normalized,
-      sessionPrefix: sessionApprovalPrefix(command)
+      sessionPrefix: sessionApprovalPrefix(command),
+      reasonCode,
+      policyReason
     }
   };
   return `${APPROVAL_REQUIRED_PREFIX}${JSON.stringify(payload)}`;
@@ -301,23 +331,23 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
       case 'run_shell': {
         const command = stringArg(call.args, 'command');
         if (context.mode !== 'auto') {
+          const usedOneTimeApproval = consumeOneTimeApproval(command, context.cwd);
+          const approvedInSession = !usedOneTimeApproval && isSessionApprovedCommand(command, context.cwd);
+          const approvedGlobally = !usedOneTimeApproval && isGloballyApprovedCommand(command);
+          const isApproved = usedOneTimeApproval || approvedInSession || approvedGlobally;
           const check = validateShellCommand(command, runtimePolicy);
-          if (!check.ok) {
-            output = `Denied by security policy: ${check.reason ?? 'unsafe command.'}`;
-            audit(context, call, false, output);
+
+          if (!isApproved && !check.ok) {
+            const reason = check.reason ?? 'unsafe command.';
+            const reasonCode = reasonCodeFromPolicyReason(reason);
+            output = buildApprovalPayload(command, reasonCode, reason);
+            audit(context, call, false, `Approval required before shell execution (${reasonCode}).`);
             return output;
           }
-          if (!consumeOneTimeApproval(command, context.cwd)) {
-            const approvedInSession = isSessionApprovedCommand(command, context.cwd);
-            const approvedGlobally = isGloballyApprovedCommand(command);
-            if (!approvedInSession && !approvedGlobally) {
-              output = buildApprovalPayload(command);
-              audit(context, call, false, 'Approval required before shell execution.');
-              return output;
-            }
-          }
-          if (output.startsWith(APPROVAL_REQUIRED_PREFIX)) {
-            audit(context, call, false, output);
+
+          if (!isApproved) {
+            output = buildApprovalPayload(command, 'approval_required');
+            audit(context, call, false, 'Approval required before shell execution.');
             return output;
           }
         }

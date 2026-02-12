@@ -40,7 +40,7 @@ After that, `happycode` is available in any directory.
 ## Initialize config
 
 ```bash
-happycode init --base-url https://api.openai.com/v1 --api-key sk-xxx --model gpt-4o-mini
+happycode init --base-url https://api.openai.com/v1 --api-key sk-xxx --model gpt-4o-mini --max-turns 24
 ```
 
 Config path:
@@ -96,6 +96,20 @@ For `run` and/or `chat`:
 - `--system-prompt <text>`
 - `--append-system-prompt <text>`
 
+`max-turns` resolution order:
+
+- CLI `--max-turns` override
+- config `maxTurns` from `happycode init --max-turns`
+- fallback default `24`
+
+Recommended ranges:
+
+- `8-12`: small Q&A and tiny edits
+- `16-24`: normal coding tasks (recommended)
+- `32+`: larger multi-step tasks (higher cost/latency)
+
+If you see `Stopped after max tool turns (...)`, increase `--max-turns` or split the task into smaller phases.
+
 `chat` output modes:
 
 - `--json`
@@ -127,13 +141,17 @@ happycode run --resume <sessionId>
 HappyCode injects persistent memory into system prompt dynamically on each turn.
 
 - User memory (global): `~/.happycode/memory_user.md`
-- Project memory (per repo): `<project>/.happycode-memory.md`
+- Project memory (per repo): `<project>/.happycode/memory_project.md`
+
+Legacy compatibility:
+
+- If legacy `<project>/.happycode-memory.md` exists and new path is missing, HappyCode auto-migrates to `.happycode/memory_project.md` on access.
 
 Edit memory by opening files via `/memory` and updating content manually.
 
 Injection policy:
 
-- always enabled in `run` and `chat`
+- always enabled in `run`, `chat`, and `agents`
 - soft constraints only
 - explicit user request in current turn has higher priority
 
@@ -207,11 +225,17 @@ happycode chat -m "status" --mode plan --no-audit
 
 ## Command approval flow
 
-When shell execution is requested outside `auto`, TUI will prompt 3 choices:
+When shell execution is requested outside `auto`, TUI will prompt 4 choices:
 
 - allow once (exact command, one-time)
 - allow in session (prefix in current session)
+- allow global (prefix across sessions)
 - deny
+
+Notes:
+
+- even when a command is blocked by policy prefix/deny checks, TUI still opens approval prompt
+- choosing allow once/session/global runs the current command immediately
 
 TUI commands:
 

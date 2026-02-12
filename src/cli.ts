@@ -7,7 +7,6 @@ import { MultiAgentRuntime } from './agents_runtime.js';
 import { clearGlobalCommandApprovals, getApprovalPath, getGlobalApprovalPrefixes } from './approvals.js';
 import { getAuditPath, readRecentAudit } from './audit.js';
 import { getConfigPath, readConfig, writeConfig } from './config.js';
-import { buildRuntimeMemoryPrompt } from './memory.js';
 import { SUPPORTED_MODES, type AgentMode } from './modes.js';
 import { loadMcpConfig } from './mcp.js';
 import { McpClientManager } from './mcp_client.js';
@@ -29,6 +28,27 @@ import {
 import { App } from './ui.js';
 
 const program = new Command();
+const DEFAULT_MAX_TURNS = 24;
+const MIN_MAX_TURNS = 1;
+const MAX_MAX_TURNS = 200;
+
+function parseMaxTurns(value: unknown, fallback: number, context: string): number {
+  const parsed = typeof value === 'string' ? Number.parseInt(value, 10) : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    if (value !== undefined) {
+      process.stderr.write(`[warn] Invalid --max-turns in ${context}; using ${fallback}.\n`);
+    }
+    return fallback;
+  }
+
+  const clamped = Math.max(MIN_MAX_TURNS, Math.min(MAX_MAX_TURNS, Math.trunc(parsed)));
+  if (clamped !== parsed) {
+    process.stderr.write(
+      `[warn] --max-turns in ${context} was clamped to ${clamped} (allowed ${MIN_MAX_TURNS}-${MAX_MAX_TURNS}).\n`
+    );
+  }
+  return clamped;
+}
 
 program
   .name('happycode')
@@ -41,11 +61,14 @@ program
   .requiredOption('--base-url <url>', 'OpenAI-compatible base URL, e.g. https://api.openai.com/v1')
   .requiredOption('--api-key <key>', 'API key')
   .option('--model <model>', 'Model name', 'gpt-4o-mini')
+  .option('--max-turns <n>', 'Default max tool turns', String(DEFAULT_MAX_TURNS))
   .action((options) => {
+    const maxTurns = parseMaxTurns(options.maxTurns, DEFAULT_MAX_TURNS, 'init');
     writeConfig({
       baseUrl: options.baseUrl,
       apiKey: options.apiKey,
-      model: options.model
+      model: options.model,
+      maxTurns
     });
     process.stdout.write(`Saved config to ${getConfigPath()}\n`);
   });
@@ -56,7 +79,7 @@ program
   .option('--mode <mode>', `Default mode: ${SUPPORTED_MODES.join('|')}`, 'auto')
   .option('--model <name>', 'Override model')
   .option('--fallback-model <name>', 'Fallback model on failure')
-  .option('--max-turns <n>', 'Max tool turns', '8')
+  .option('--max-turns <n>', 'Max tool turns')
   .option('--allowed-tools <csv>', 'Comma separated allowed tools')
   .option('--disallowed-tools <csv>', 'Comma separated disallowed tools')
   .option('--system-prompt <text>', 'Override system prompt')
@@ -95,7 +118,8 @@ program
     const mcpConfig = loadMcpConfig(process.cwd());
     void mcpManager.ensureServers(mcpConfig);
     const active = loadActiveSession(process.cwd());
-    const maxTurns = Number.parseInt(String(options.maxTurns), 10);
+    const resolvedFallback = cfg.maxTurns ?? DEFAULT_MAX_TURNS;
+    const maxTurns = parseMaxTurns(options.maxTurns, resolvedFallback, 'run');
     const allowedTools = String(options.allowedTools ?? '')
       .split(',')
       .map((item) => item.trim())
@@ -110,11 +134,12 @@ program
         appVersion: program.version(),
         defaultMode: mode,
         defaultModel: options.model,
+        configuredModel: cfg.model,
         defaultRuntime: {
           mode,
           model: options.model,
           fallbackModel: options.fallbackModel,
-          maxTurns: Number.isFinite(maxTurns) ? maxTurns : 8,
+          maxTurns,
           allowedTools,
           disallowedTools,
           systemPrompt: options.systemPrompt,
@@ -135,7 +160,7 @@ program
   .option('--mode <mode>', `Mode: ${SUPPORTED_MODES.join('|')}`, 'plan')
   .option('--model <name>', 'Override model')
   .option('--fallback-model <name>', 'Fallback model on failure')
-  .option('--max-turns <n>', 'Max tool turns', '8')
+  .option('--max-turns <n>', 'Max tool turns')
   .option('--allowed-tools <csv>', 'Comma separated allowed tools')
   .option('--disallowed-tools <csv>', 'Comma separated disallowed tools')
   .option('--system-prompt <text>', 'Override system prompt')
@@ -163,7 +188,8 @@ program
     const mcpConfig = loadMcpConfig(process.cwd());
     await mcpManager.ensureServers(mcpConfig);
     const mcpTools = await mcpManager.listTools();
-    const maxTurns = Number.parseInt(String(options.maxTurns), 10);
+    const resolvedFallback = cfg.maxTurns ?? DEFAULT_MAX_TURNS;
+    const maxTurns = parseMaxTurns(options.maxTurns, resolvedFallback, 'chat');
     const allowedTools = String(options.allowedTools ?? '')
       .split(',')
       .map((item) => item.trim())
@@ -181,13 +207,11 @@ program
         cwd: process.cwd(),
         model: options.model,
         fallbackModel: options.fallbackModel,
-        maxTurns: Number.isFinite(maxTurns) ? maxTurns : 8,
+        maxTurns,
         allowedTools,
         disallowedTools,
         systemPrompt: options.systemPrompt,
-        appendSystemPrompt: [options.appendSystemPrompt ?? '', buildRuntimeMemoryPrompt(process.cwd())]
-          .filter(Boolean)
-          .join('\n\n') || undefined,
+        appendSystemPrompt: options.appendSystemPrompt,
         mcpTools,
         mcpCall: (fullName, args) => mcpManager.callTool(fullName, args),
         enableAudit: options.audit !== false
