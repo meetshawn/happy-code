@@ -13,7 +13,6 @@ import {
 import { readRecentAudit, getAuditPath } from './audit.js';
 import { getConfigPath, readConfig } from './config.js';
 import {
-  buildRuntimeMemoryPrompt,
   getMemoryPath,
   getProjectMemoryPath,
   openMemoryFile,
@@ -49,6 +48,7 @@ type Props = {
   defaultMode?: AgentMode;
   enableAudit?: boolean;
   defaultModel?: string;
+  configuredModel?: string;
   appVersion?: string;
   defaultRuntime?: Partial<RuntimeOptions>;
   mcpManager?: McpClientManager;
@@ -98,12 +98,6 @@ type UserQuestionPayload = {
 };
 
 type UserQuestionFocus = 'type' | 'option';
-
-type ModeIndicator = {
-  mode: AgentMode;
-  source: 'hotkey' | 'init';
-  updatedAt: number;
-};
 
 type ThemeName = 'black-yellow' | 'cyber' | 'minimal';
 
@@ -197,7 +191,39 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/exit', complete: '/exit', desc: 'Quit' }
 ];
 
-const HELP_TEXT = COMMANDS.map((item) => `${item.cmd.padEnd(34, ' ')} ${item.desc}`).join('\n');
+type ModeDisplay = {
+  label: string;
+  hint: string;
+  color: 'yellow' | 'blue' | 'green';
+};
+
+const MODE_DISPLAY: Record<AgentMode, ModeDisplay> = {
+  auto: {
+    label: 'Auto',
+    hint: 'Automatically chooses planning or execution',
+    color: 'yellow'
+  },
+  edit: {
+    label: 'Edit',
+    hint: 'Directly implements changes in code',
+    color: 'blue'
+  },
+  plan: {
+    label: 'Plan',
+    hint: 'Focuses on analysis and step-by-step planning',
+    color: 'green'
+  }
+};
+
+const HELP_TEXT = [
+  COMMANDS.map((item) => `${item.cmd.padEnd(34, ' ')} ${item.desc}`).join('\n'),
+  '',
+  'Modes:',
+  '  plan  Analysis and implementation planning',
+  '  edit  Direct coding and code changes',
+  '  auto  Adaptive mode selection',
+  'Shortcut: Shift+Tab to cycle modes'
+].join('\n');
 const MODE_CYCLE: AgentMode[] = ['plan', 'edit', 'auto'];
 const MAX_RENDER_FLOW_ITEMS = 120;
 const MAX_TOOL_EVENTS_STORE = 2000;
@@ -237,6 +263,10 @@ function formatRelativeTime(iso: string, now = Date.now()): string {
     return `${Math.floor(diffSeconds / 3600)}h ago`;
   }
   return `${Math.floor(diffSeconds / 86400)}d ago`;
+}
+
+function isShiftTabInput(inputKey: string, key: { tab?: boolean; shift?: boolean }): boolean {
+  return (key.tab && key.shift) || inputKey === '\u001b[Z';
 }
 
 function formatToolTag(name: string): string {
@@ -383,6 +413,7 @@ export function App({
   defaultMode = 'auto',
   enableAudit = true,
   defaultModel,
+  configuredModel,
   appVersion = '0.1.0',
   defaultRuntime,
   mcpManager
@@ -397,7 +428,7 @@ export function App({
     mode: initialMode,
     model: defaultRuntime?.model ?? defaultModel,
     fallbackModel: defaultRuntime?.fallbackModel,
-    maxTurns: defaultRuntime?.maxTurns ?? 8,
+    maxTurns: defaultRuntime?.maxTurns ?? 24,
     allowedTools: defaultRuntime?.allowedTools ?? [],
     disallowedTools: defaultRuntime?.disallowedTools ?? [],
     systemPrompt: defaultRuntime?.systemPrompt,
@@ -410,11 +441,6 @@ export function App({
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [modeIndicator, setModeIndicator] = useState<ModeIndicator>({
-    mode: initialMode,
-    source: 'init',
-    updatedAt: Date.now()
-  });
   const [resumePickerOpen, setResumePickerOpen] = useState(false);
   const [resumeCandidates, setResumeCandidates] = useState<SessionRecord[]>([]);
   const [resumeCursor, setResumeCursor] = useState(0);
@@ -432,7 +458,7 @@ export function App({
   const streamingFlushTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const themeStyle = THEME_STYLES[theme];
-  const projectName = useMemo(() => path.basename(process.cwd()), []);
+  const projectPath = useMemo(() => process.cwd(), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
   const flowSeparator = useMemo(() => '─'.repeat(contentWidth), [contentWidth]);
 
@@ -440,7 +466,6 @@ export function App({
     setRuntime((prev) => {
       const currentIdx = MODE_CYCLE.indexOf(prev.mode);
       const nextMode = MODE_CYCLE[(currentIdx + 1 + MODE_CYCLE.length) % MODE_CYCLE.length] ?? MODE_CYCLE[0];
-      setModeIndicator({ mode: nextMode, source: 'hotkey', updatedAt: Date.now() });
       return { ...prev, mode: nextMode };
     });
   }, []);
@@ -752,7 +777,7 @@ export function App({
       return;
     }
 
-    if (key.tab && key.shift) {
+    if (isShiftTabInput(inputKey, key)) {
       shiftMode();
       setError(null);
       return;
@@ -832,8 +857,6 @@ export function App({
 
       try {
         const mcpTools = mcpManager ? await mcpManager.listTools() : [];
-        const memoryPrompt = buildRuntimeMemoryPrompt(process.cwd());
-        const mergedAppendPrompt = [runtime.appendSystemPrompt ?? '', memoryPrompt].filter(Boolean).join('\n\n');
         const reply = await agent.chatStream(
           nextHistory,
           {
@@ -846,7 +869,7 @@ export function App({
             allowedTools: runtime.allowedTools,
             disallowedTools: runtime.disallowedTools,
             systemPrompt: runtime.systemPrompt,
-            appendSystemPrompt: mergedAppendPrompt || undefined,
+            appendSystemPrompt: runtime.appendSystemPrompt,
             mcpTools,
             mcpCall: mcpManager
               ? (fullName, args) => mcpManager.callTool(fullName, args)
@@ -1654,14 +1677,19 @@ export function App({
     return rows.slice(-MAX_RENDER_FLOW_ITEMS);
   }, [history, toolStepsByTurn]);
 
+  const modeDisplay = MODE_DISPLAY[runtime.mode] ?? MODE_DISPLAY.auto;
+
   return (
     <Box flexDirection="column" padding={1}>
       <Box borderStyle="round" borderColor={themeStyle.titleColor} paddingX={1} flexDirection="column" width={contentWidth}>
         <Text color={themeStyle.titleColor}>:) HappyCode</Text>
-        <Text color={themeStyle.metaColor}>Project: {projectName}</Text>
-        <Text color={themeStyle.metaColor}>Mode: {runtime.mode}</Text>
-        {runtime.mode === 'plan' ? <Text color="yellow">PLAN MODE ACTIVE</Text> : null}
-        <Text color={themeStyle.metaColor}>Model: {runtime.model ?? '(default)'}</Text>
+        <Text color={themeStyle.metaColor}>Project: {projectPath}</Text>
+        <Text color={themeStyle.metaColor}>Model: {configuredModel ?? '(not configured)'}</Text>
+        <Box>
+          <Text color={themeStyle.metaColor}>Mode: </Text>
+          <Text color={modeDisplay.color}>{modeDisplay.label}</Text>
+          <Text color={themeStyle.metaColor}> (Shift+Tab cycles)</Text>
+        </Box>
         <Text color={themeStyle.metaColor}>Version: {appVersion}</Text>
       </Box>
       <Box marginTop={1} flexDirection="column" width={contentWidth}>
@@ -1740,11 +1768,11 @@ export function App({
           <TextInput key={inputKey} value={input} onChange={setInput} onSubmit={submit} />
           {inlineParamPlaceholder ? <Text color="gray">{inlineParamPlaceholder}</Text> : null}
         </Box>
-        <Text color="yellow">
-          {modeIndicator.source === 'init'
-            ? `Current mode: ${modeIndicator.mode}`
-            : `Mode switched (Shift+Tab): ${modeIndicator.mode}`}
-        </Text>
+        <Box>
+          <Text color="gray">Mode: </Text>
+          <Text color={modeDisplay.color}>{modeDisplay.label}</Text>
+          <Text color="gray"> - {modeDisplay.hint} (Shift+Tab to cycle)</Text>
+        </Box>
       </Box>
 
       {inputSuggestions.length > 0 ? (

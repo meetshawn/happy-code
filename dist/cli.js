@@ -5,10 +5,12 @@ import {
   allowGlobalCommandPrefix,
   approveCommandForSession,
   approveCommandOnce,
+  buildRuntimeMemoryPrompt,
   clearGlobalCommandApprovals,
   clearSession,
   clearSessionApprovals,
   createSession,
+  ensureMemoryFile,
   forkActiveSession,
   getApprovalPath,
   getAuditPath,
@@ -16,7 +18,9 @@ import {
   getGlobalApprovalPrefixes,
   getGlobalPolicyPath,
   getLegacySessionPath,
+  getMemoryPath,
   getPolicyPath,
+  getProjectMemoryPath,
   getSessionRootPath,
   listSessionApprovals,
   listSessions,
@@ -24,6 +28,7 @@ import {
   loadSessionById,
   loadSessionMessages,
   loadSessionToolEvents,
+  openMemoryFile,
   readConfig,
   readRecentAudit,
   renameActiveSession,
@@ -34,7 +39,7 @@ import {
   writeConfig,
   writeDefaultGlobalPolicy,
   writeDefaultPolicy
-} from "./chunk-VAIDQTCK.js";
+} from "./chunk-HBQOEFEV.js";
 
 // src/cli.ts
 import React2 from "react";
@@ -55,7 +60,8 @@ var MultiAgentRuntime = class {
           mode: task.mode,
           cwd: context.cwd,
           enableAudit: context.enableAudit,
-          maxTurns: context.maxTurns ?? 6
+          maxTurns: context.maxTurns ?? 12,
+          appendSystemPrompt: buildRuntimeMemoryPrompt(context.cwd)
         }
       );
       outputs.push({
@@ -72,264 +78,20 @@ ${item.output}`).join("\n\n");
   }
 };
 
-// src/memory.ts
-import fs from "fs";
-import os from "os";
-import path from "path";
-import { exec } from "child_process";
-var GLOBAL_MEMORY_PATH = path.join(os.homedir(), ".happycode", "memory_user.md");
-var LEGACY_MEMORY_PATH = path.join(os.homedir(), ".happycode", "memory.md");
-var PROJECT_MEMORY_FILE = ".happycode-memory.md";
-var MEMORY_PROMPT_MAX_CHARS = 2400;
-var SECTION_LABELS = {
-  facts: "Facts",
-  preferences: "Preferences",
-  constraints: "Constraints",
-  notes: "Notes"
-};
-var SECTION_PRIORITY = ["constraints", "preferences", "facts", "notes"];
-function normalizeLine(text) {
-  return text.replace(/\s+/g, " ").trim();
-}
-function emptyDocument(scope) {
-  return {
-    scope,
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    facts: [],
-    preferences: [],
-    constraints: [],
-    notes: []
-  };
-}
-function parseSectionLabel(raw) {
-  const normalized = normalizeLine(raw).toLowerCase();
-  if (normalized === "facts") {
-    return "facts";
-  }
-  if (normalized === "preferences") {
-    return "preferences";
-  }
-  if (normalized === "constraints") {
-    return "constraints";
-  }
-  if (normalized === "notes") {
-    return "notes";
-  }
-  return null;
-}
-function parseMemoryMarkdown(content, scope) {
-  const doc = emptyDocument(scope);
-  let activeSection = null;
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    if (trimmed.startsWith("# ")) {
-      continue;
-    }
-    if (trimmed.startsWith("## ")) {
-      activeSection = parseSectionLabel(trimmed.slice(3));
-      continue;
-    }
-    if (trimmed.startsWith("- updatedAt:")) {
-      const raw = normalizeLine(trimmed.slice("- updatedAt:".length));
-      if (raw) {
-        doc.updatedAt = raw;
-      }
-      continue;
-    }
-    if (!activeSection) {
-      continue;
-    }
-    const value = trimmed.startsWith("- ") ? normalizeLine(trimmed.slice(2)) : normalizeLine(trimmed);
-    if (!value) {
-      continue;
-    }
-    doc[activeSection].push(value);
-  }
-  return doc;
-}
-function toMemoryMarkdown(doc) {
-  const lines = [
-    "# HappyCode Memory",
-    "## Meta",
-    `- scope: ${doc.scope}`,
-    `- updatedAt: ${doc.updatedAt}`
-  ];
-  for (const section of SECTION_PRIORITY) {
-    lines.push(`## ${SECTION_LABELS[section]}`);
-    const entries = doc[section];
-    if (entries.length === 0) {
-      lines.push("- (empty)");
-      continue;
-    }
-    for (const item of entries) {
-      lines.push(`- ${item}`);
-    }
-  }
-  return `${lines.join("\n")}
-`;
-}
-function defaultMemoryMarkdown(scope) {
-  return toMemoryMarkdown(emptyDocument(scope));
-}
-function ensureParentDir(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-}
-function scopePath(scope, cwd = process.cwd()) {
-  if (scope === "user") {
-    return GLOBAL_MEMORY_PATH;
-  }
-  return path.join(cwd, PROJECT_MEMORY_FILE);
-}
-function enforceUniqueSection(items) {
-  const seen = /* @__PURE__ */ new Set();
-  const deduped = [];
-  for (const item of items) {
-    const normalized = normalizeLine(item);
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    deduped.push(normalized);
-  }
-  return deduped;
-}
-function truncateBlock(lines, limit) {
-  const buffer = [];
-  for (const line of lines) {
-    const next = buffer.length === 0 ? line : `${buffer.join("\n")}
-${line}`;
-    if (next.length > limit) {
-      if (buffer.length === 0) {
-        return `${line.slice(0, Math.max(0, limit - 3))}...`;
-      }
-      return `${buffer.join("\n")}
-...`;
-    }
-    buffer.push(line);
-  }
-  return buffer.join("\n");
-}
-function buildScopePrompt(title, doc, limit) {
-  const lines = [title];
-  for (const section of SECTION_PRIORITY) {
-    const entries = doc[section];
-    if (entries.length === 0) {
-      continue;
-    }
-    lines.push(`${SECTION_LABELS[section]}:`);
-    for (const entry of entries) {
-      lines.push(`- ${entry}`);
-    }
-  }
-  if (lines.length === 1) {
-    lines.push("- (empty)");
-  }
-  return truncateBlock(lines, limit);
-}
-function getMemoryPath() {
-  return GLOBAL_MEMORY_PATH;
-}
-function getProjectMemoryPath(cwd = process.cwd()) {
-  return scopePath("project", cwd);
-}
-function readMemoryDocument(scope = "user", cwd = process.cwd()) {
-  const target = scopePath(scope, cwd);
-  if (!fs.existsSync(target)) {
-    if (scope === "user" && fs.existsSync(LEGACY_MEMORY_PATH)) {
-      const legacy = fs.readFileSync(LEGACY_MEMORY_PATH, "utf8");
-      const migrated = parseMemoryMarkdown(legacy, scope);
-      writeMemoryDocument(scope, migrated, cwd);
-      return migrated;
-    }
-    return emptyDocument(scope);
-  }
-  const raw = fs.readFileSync(target, "utf8");
-  return parseMemoryMarkdown(raw, scope);
-}
-function writeMemoryDocument(scope, doc, cwd = process.cwd()) {
-  const target = scopePath(scope, cwd);
-  ensureParentDir(target);
-  const normalized = {
-    ...doc,
-    scope,
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    facts: enforceUniqueSection(doc.facts),
-    preferences: enforceUniqueSection(doc.preferences),
-    constraints: enforceUniqueSection(doc.constraints),
-    notes: enforceUniqueSection(doc.notes)
-  };
-  fs.writeFileSync(target, toMemoryMarkdown(normalized), "utf8");
-}
-function ensureMemoryFile(scope, cwd = process.cwd()) {
-  const target = scopePath(scope, cwd);
-  if (!fs.existsSync(target)) {
-    ensureParentDir(target);
-    fs.writeFileSync(target, defaultMemoryMarkdown(scope), "utf8");
-  }
-  return target;
-}
-async function openMemoryFile(scope, cwd = process.cwd()) {
-  const target = ensureMemoryFile(scope, cwd);
-  const escaped = target.replace(/"/g, '\\"');
-  const command = process.platform === "win32" ? `start "" "${escaped}"` : process.platform === "darwin" ? `open "${escaped}"` : `xdg-open "${escaped}"`;
-  return new Promise((resolve) => {
-    exec(command, (error) => {
-      if (error) {
-        resolve({
-          ok: false,
-          path: target,
-          message: `Failed to open memory file automatically: ${error.message}`
-        });
-        return;
-      }
-      resolve({
-        ok: true,
-        path: target,
-        message: `Opened ${scope} memory file.`
-      });
-    });
-  });
-}
-function buildRuntimeMemoryPrompt(cwd = process.cwd(), maxChars = MEMORY_PROMPT_MAX_CHARS) {
-  const userDoc = readMemoryDocument("user", cwd);
-  const projectDoc = readMemoryDocument("project", cwd);
-  const perScope = Math.max(200, Math.floor(maxChars / 2));
-  const userBlock = buildScopePrompt("User Memory:", userDoc, perScope);
-  const projectBlock = buildScopePrompt("Project Memory:", projectDoc, perScope);
-  const merged = [
-    "[Persistent Memory]",
-    userBlock,
-    "",
-    projectBlock,
-    "",
-    "Use memory as soft constraints. If explicit user request conflicts in this turn, follow current request."
-  ].join("\n").trim();
-  if (merged === "[Persistent Memory]") {
-    return "";
-  }
-  if (merged.length <= maxChars) {
-    return merged;
-  }
-  return `${merged.slice(0, Math.max(0, maxChars - 3))}...`;
-}
-
 // src/mcp.ts
-import fs2 from "fs";
-import path2 from "path";
+import fs from "fs";
+import path from "path";
 var MCP_CONFIG_NAME = ".happycode-mcp.json";
 function getMcpConfigPath(cwd) {
-  return path2.join(cwd, MCP_CONFIG_NAME);
+  return path.join(cwd, MCP_CONFIG_NAME);
 }
 function loadMcpConfig(cwd) {
   const p = getMcpConfigPath(cwd);
-  if (!fs2.existsSync(p)) {
+  if (!fs.existsSync(p)) {
     return { servers: [] };
   }
   try {
-    const raw = fs2.readFileSync(p, "utf8");
+    const raw = fs.readFileSync(p, "utf8");
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed.servers)) {
       return { servers: [] };
@@ -341,7 +103,7 @@ function loadMcpConfig(cwd) {
 }
 function saveMcpConfig(cwd, config) {
   const p = getMcpConfigPath(cwd);
-  fs2.writeFileSync(p, `${JSON.stringify(config, null, 2)}
+  fs.writeFileSync(p, `${JSON.stringify(config, null, 2)}
 `, "utf8");
   return p;
 }
@@ -495,8 +257,8 @@ var McpClientManager = class {
 };
 
 // src/ui.tsx
-import fs3 from "fs";
-import path3 from "path";
+import fs2 from "fs";
+import path2 from "path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
@@ -572,7 +334,32 @@ var COMMANDS = [
   { cmd: "/clear", complete: "/clear", desc: "Clear conversation" },
   { cmd: "/exit", complete: "/exit", desc: "Quit" }
 ];
-var HELP_TEXT = COMMANDS.map((item) => `${item.cmd.padEnd(34, " ")} ${item.desc}`).join("\n");
+var MODE_DISPLAY = {
+  auto: {
+    label: "Auto",
+    hint: "Automatically chooses planning or execution",
+    color: "yellow"
+  },
+  edit: {
+    label: "Edit",
+    hint: "Directly implements changes in code",
+    color: "blue"
+  },
+  plan: {
+    label: "Plan",
+    hint: "Focuses on analysis and step-by-step planning",
+    color: "green"
+  }
+};
+var HELP_TEXT = [
+  COMMANDS.map((item) => `${item.cmd.padEnd(34, " ")} ${item.desc}`).join("\n"),
+  "",
+  "Modes:",
+  "  plan  Analysis and implementation planning",
+  "  edit  Direct coding and code changes",
+  "  auto  Adaptive mode selection",
+  "Shortcut: Shift+Tab to cycle modes"
+].join("\n");
 var MODE_CYCLE = ["plan", "edit", "auto"];
 var MAX_RENDER_FLOW_ITEMS = 120;
 var MAX_TOOL_EVENTS_STORE = 2e3;
@@ -609,6 +396,9 @@ function formatRelativeTime(iso, now = Date.now()) {
     return `${Math.floor(diffSeconds / 3600)}h ago`;
   }
   return `${Math.floor(diffSeconds / 86400)}d ago`;
+}
+function isShiftTabInput(inputKey, key) {
+  return key.tab && key.shift || inputKey === "\x1B[Z";
 }
 function formatToolTag(name) {
   const short = name.startsWith("mcp__") ? name.replace(/^mcp__/, "").replace(/__/g, "/") : name;
@@ -716,8 +506,8 @@ function parseMentionFiles(input, cwd) {
   const matches = [...input.matchAll(/@([^\s]+)/g)].map((m) => m[1]).filter(Boolean);
   const files = [];
   for (const item of matches) {
-    const full = path3.resolve(cwd, item);
-    if (fs3.existsSync(full) && fs3.statSync(full).isFile()) {
+    const full = path2.resolve(cwd, item);
+    if (fs2.existsSync(full) && fs2.statSync(full).isFile()) {
       files.push(item);
     }
   }
@@ -730,6 +520,7 @@ function App({
   defaultMode = "auto",
   enableAudit = true,
   defaultModel,
+  configuredModel,
   appVersion = "0.1.0",
   defaultRuntime,
   mcpManager
@@ -744,7 +535,7 @@ function App({
     mode: initialMode,
     model: defaultRuntime?.model ?? defaultModel,
     fallbackModel: defaultRuntime?.fallbackModel,
-    maxTurns: defaultRuntime?.maxTurns ?? 8,
+    maxTurns: defaultRuntime?.maxTurns ?? 24,
     allowedTools: defaultRuntime?.allowedTools ?? [],
     disallowedTools: defaultRuntime?.disallowedTools ?? [],
     systemPrompt: defaultRuntime?.systemPrompt,
@@ -757,11 +548,6 @@ function App({
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
   const [error, setError] = useState(null);
-  const [modeIndicator, setModeIndicator] = useState({
-    mode: initialMode,
-    source: "init",
-    updatedAt: Date.now()
-  });
   const [resumePickerOpen, setResumePickerOpen] = useState(false);
   const [resumeCandidates, setResumeCandidates] = useState([]);
   const [resumeCursor, setResumeCursor] = useState(0);
@@ -778,14 +564,13 @@ function App({
   const streamingBufferRef = useRef("");
   const streamingFlushTimerRef = useRef(null);
   const themeStyle = THEME_STYLES[theme];
-  const projectName = useMemo(() => path3.basename(process.cwd()), []);
+  const projectPath = useMemo(() => process.cwd(), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
   const flowSeparator = useMemo(() => "\u2500".repeat(contentWidth), [contentWidth]);
   const shiftMode = useCallback(() => {
     setRuntime((prev) => {
       const currentIdx = MODE_CYCLE.indexOf(prev.mode);
       const nextMode = MODE_CYCLE[(currentIdx + 1 + MODE_CYCLE.length) % MODE_CYCLE.length] ?? MODE_CYCLE[0];
-      setModeIndicator({ mode: nextMode, source: "hotkey", updatedAt: Date.now() });
       return { ...prev, mode: nextMode };
     });
   }, []);
@@ -1057,7 +842,7 @@ function App({
       setError(null);
       return;
     }
-    if (key.tab && key.shift) {
+    if (isShiftTabInput(inputKey2, key)) {
       shiftMode();
       setError(null);
       return;
@@ -1088,8 +873,8 @@ function App({
       let enhancedPrompt = taskPrompt;
       if (mentionFiles.length > 0) {
         const inline = mentionFiles.map((file) => {
-          const full = path3.resolve(process.cwd(), file);
-          const content = fs3.readFileSync(full, "utf8").slice(0, 2e4);
+          const full = path2.resolve(process.cwd(), file);
+          const content = fs2.readFileSync(full, "utf8").slice(0, 2e4);
           return `
 [FILE: ${file}]
 ${content}`;
@@ -1125,8 +910,6 @@ Referenced files content:${inline}`;
       });
       try {
         const mcpTools = mcpManager ? await mcpManager.listTools() : [];
-        const memoryPrompt = buildRuntimeMemoryPrompt(process.cwd());
-        const mergedAppendPrompt = [runtime.appendSystemPrompt ?? "", memoryPrompt].filter(Boolean).join("\n\n");
         const reply = await agent.chatStream(
           nextHistory,
           {
@@ -1139,7 +922,7 @@ Referenced files content:${inline}`;
             allowedTools: runtime.allowedTools,
             disallowedTools: runtime.disallowedTools,
             systemPrompt: runtime.systemPrompt,
-            appendSystemPrompt: mergedAppendPrompt || void 0,
+            appendSystemPrompt: runtime.appendSystemPrompt,
             mcpTools,
             mcpCall: mcpManager ? (fullName, args) => mcpManager.callTool(fullName, args) : void 0,
             onUserQuestion: (payload) => new Promise((resolve) => {
@@ -1302,12 +1085,12 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content === "/doctor") {
         const checks = [
-          `config_exists: ${fs3.existsSync(getConfigPath())}`,
-          `policy_exists: ${fs3.existsSync(getPolicyPath(process.cwd()))}`,
-          `mcp_exists: ${fs3.existsSync(getMcpConfigPath(process.cwd()))}`,
-          `memory_user_exists: ${fs3.existsSync(getMemoryPath())}`,
-          `memory_project_exists: ${fs3.existsSync(getProjectMemoryPath(process.cwd()))}`,
-          `audit_exists: ${fs3.existsSync(getAuditPath())}`
+          `config_exists: ${fs2.existsSync(getConfigPath())}`,
+          `policy_exists: ${fs2.existsSync(getPolicyPath(process.cwd()))}`,
+          `mcp_exists: ${fs2.existsSync(getMcpConfigPath(process.cwd()))}`,
+          `memory_user_exists: ${fs2.existsSync(getMemoryPath())}`,
+          `memory_project_exists: ${fs2.existsSync(getProjectMemoryPath(process.cwd()))}`,
+          `audit_exists: ${fs2.existsSync(getAuditPath())}`
         ].join("\n");
         pushAssistant(checks, setHistory, onHistoryChange);
         return true;
@@ -1566,11 +1349,11 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content.startsWith("/export")) {
         const target = content.replace("/export", "").trim();
-        const outputPath = target || path3.join(process.cwd(), "happycode-export.md");
+        const outputPath = target || path2.join(process.cwd(), "happycode-export.md");
         const body = history.map((item) => `## ${item.role.toUpperCase()}
 
 ${item.content}`).join("\n\n");
-        fs3.writeFileSync(outputPath, `${body}
+        fs2.writeFileSync(outputPath, `${body}
 `, "utf8");
         pushAssistant(`Exported conversation to: ${outputPath}`, setHistory, onHistoryChange);
         return true;
@@ -1852,21 +1635,22 @@ Use /help`, setHistory, onHistoryChange);
     }
     return rows.slice(-MAX_RENDER_FLOW_ITEMS);
   }, [history, toolStepsByTurn]);
+  const modeDisplay = MODE_DISPLAY[runtime.mode] ?? MODE_DISPLAY.auto;
   return /* @__PURE__ */ jsxs(Box, { flexDirection: "column", padding: 1, children: [
     /* @__PURE__ */ jsxs(Box, { borderStyle: "round", borderColor: themeStyle.titleColor, paddingX: 1, flexDirection: "column", width: contentWidth, children: [
       /* @__PURE__ */ jsx(Text, { color: themeStyle.titleColor, children: ":) HappyCode" }),
       /* @__PURE__ */ jsxs(Text, { color: themeStyle.metaColor, children: [
         "Project: ",
-        projectName
+        projectPath
       ] }),
-      /* @__PURE__ */ jsxs(Text, { color: themeStyle.metaColor, children: [
-        "Mode: ",
-        runtime.mode
-      ] }),
-      runtime.mode === "plan" ? /* @__PURE__ */ jsx(Text, { color: "yellow", children: "PLAN MODE ACTIVE" }) : null,
       /* @__PURE__ */ jsxs(Text, { color: themeStyle.metaColor, children: [
         "Model: ",
-        runtime.model ?? "(default)"
+        configuredModel ?? "(not configured)"
+      ] }),
+      /* @__PURE__ */ jsxs(Box, { children: [
+        /* @__PURE__ */ jsx(Text, { color: themeStyle.metaColor, children: "Mode: " }),
+        /* @__PURE__ */ jsx(Text, { color: modeDisplay.color, children: modeDisplay.label }),
+        /* @__PURE__ */ jsx(Text, { color: themeStyle.metaColor, children: " (Shift+Tab cycles)" })
       ] }),
       /* @__PURE__ */ jsxs(Text, { color: themeStyle.metaColor, children: [
         "Version: ",
@@ -1925,7 +1709,15 @@ Use /help`, setHistory, onHistoryChange);
         /* @__PURE__ */ jsx(TextInput, { value: input, onChange: setInput, onSubmit: submit }, inputKey),
         inlineParamPlaceholder ? /* @__PURE__ */ jsx(Text, { color: "gray", children: inlineParamPlaceholder }) : null
       ] }),
-      /* @__PURE__ */ jsx(Text, { color: "yellow", children: modeIndicator.source === "init" ? `Current mode: ${modeIndicator.mode}` : `Mode switched (Shift+Tab): ${modeIndicator.mode}` })
+      /* @__PURE__ */ jsxs(Box, { children: [
+        /* @__PURE__ */ jsx(Text, { color: "gray", children: "Mode: " }),
+        /* @__PURE__ */ jsx(Text, { color: modeDisplay.color, children: modeDisplay.label }),
+        /* @__PURE__ */ jsxs(Text, { color: "gray", children: [
+          " - ",
+          modeDisplay.hint,
+          " (Shift+Tab to cycle)"
+        ] })
+      ] })
     ] }),
     inputSuggestions.length > 0 ? /* @__PURE__ */ jsxs(Box, { flexDirection: "column", children: [
       /* @__PURE__ */ jsx(Text, { color: "white", children: "Command Hints" }),
@@ -1986,17 +1778,40 @@ Use /help`, setHistory, onHistoryChange);
 
 // src/cli.ts
 var program = new Command();
+var DEFAULT_MAX_TURNS = 24;
+var MIN_MAX_TURNS = 1;
+var MAX_MAX_TURNS = 200;
+function parseMaxTurns(value, fallback, context) {
+  const parsed = typeof value === "string" ? Number.parseInt(value, 10) : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    if (value !== void 0) {
+      process.stderr.write(`[warn] Invalid --max-turns in ${context}; using ${fallback}.
+`);
+    }
+    return fallback;
+  }
+  const clamped = Math.max(MIN_MAX_TURNS, Math.min(MAX_MAX_TURNS, Math.trunc(parsed)));
+  if (clamped !== parsed) {
+    process.stderr.write(
+      `[warn] --max-turns in ${context} was clamped to ${clamped} (allowed ${MIN_MAX_TURNS}-${MAX_MAX_TURNS}).
+`
+    );
+  }
+  return clamped;
+}
 program.name("happycode").description("Coding-focused TUI for OpenAI-compatible APIs").version("0.1.0");
-program.command("init").description("Save base URL and API key").requiredOption("--base-url <url>", "OpenAI-compatible base URL, e.g. https://api.openai.com/v1").requiredOption("--api-key <key>", "API key").option("--model <model>", "Model name", "gpt-4o-mini").action((options) => {
+program.command("init").description("Save base URL and API key").requiredOption("--base-url <url>", "OpenAI-compatible base URL, e.g. https://api.openai.com/v1").requiredOption("--api-key <key>", "API key").option("--model <model>", "Model name", "gpt-4o-mini").option("--max-turns <n>", "Default max tool turns", String(DEFAULT_MAX_TURNS)).action((options) => {
+  const maxTurns = parseMaxTurns(options.maxTurns, DEFAULT_MAX_TURNS, "init");
   writeConfig({
     baseUrl: options.baseUrl,
     apiKey: options.apiKey,
-    model: options.model
+    model: options.model,
+    maxTurns
   });
   process.stdout.write(`Saved config to ${getConfigPath()}
 `);
 });
-program.command("run").description("Start TUI").option("--mode <mode>", `Default mode: ${SUPPORTED_MODES.join("|")}`, "auto").option("--model <name>", "Override model").option("--fallback-model <name>", "Fallback model on failure").option("--max-turns <n>", "Max tool turns", "8").option("--allowed-tools <csv>", "Comma separated allowed tools").option("--disallowed-tools <csv>", "Comma separated disallowed tools").option("--system-prompt <text>", "Override system prompt").option("--append-system-prompt <text>", "Append additional system prompt text").option("--resume <sessionId>", "Resume by session id").option("--new [name]", "Start a fresh session").option("--no-audit", "Disable tool audit log").action((options) => {
+program.command("run").description("Start TUI").option("--mode <mode>", `Default mode: ${SUPPORTED_MODES.join("|")}`, "auto").option("--model <name>", "Override model").option("--fallback-model <name>", "Fallback model on failure").option("--max-turns <n>", "Max tool turns").option("--allowed-tools <csv>", "Comma separated allowed tools").option("--disallowed-tools <csv>", "Comma separated disallowed tools").option("--system-prompt <text>", "Override system prompt").option("--append-system-prompt <text>", "Append additional system prompt text").option("--resume <sessionId>", "Resume by session id").option("--new [name]", "Start a fresh session").option("--no-audit", "Disable tool audit log").action((options) => {
   const cfg = readConfig();
   if (!cfg) {
     process.stderr.write(
@@ -2026,7 +1841,8 @@ program.command("run").description("Start TUI").option("--mode <mode>", `Default
   const mcpConfig = loadMcpConfig(process.cwd());
   void mcpManager.ensureServers(mcpConfig);
   const active = loadActiveSession(process.cwd());
-  const maxTurns = Number.parseInt(String(options.maxTurns), 10);
+  const resolvedFallback = cfg.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxTurns = parseMaxTurns(options.maxTurns, resolvedFallback, "run");
   const allowedTools = String(options.allowedTools ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   const disallowedTools = String(options.disallowedTools ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   render(
@@ -2035,11 +1851,12 @@ program.command("run").description("Start TUI").option("--mode <mode>", `Default
       appVersion: program.version(),
       defaultMode: mode,
       defaultModel: options.model,
+      configuredModel: cfg.model,
       defaultRuntime: {
         mode,
         model: options.model,
         fallbackModel: options.fallbackModel,
-        maxTurns: Number.isFinite(maxTurns) ? maxTurns : 8,
+        maxTurns,
         allowedTools,
         disallowedTools,
         systemPrompt: options.systemPrompt,
@@ -2052,7 +1869,7 @@ program.command("run").description("Start TUI").option("--mode <mode>", `Default
     })
   );
 });
-program.command("chat").description("Single-turn non-interactive chat").requiredOption("-m, --message <text>", "User message").option("--mode <mode>", `Mode: ${SUPPORTED_MODES.join("|")}`, "plan").option("--model <name>", "Override model").option("--fallback-model <name>", "Fallback model on failure").option("--max-turns <n>", "Max tool turns", "8").option("--allowed-tools <csv>", "Comma separated allowed tools").option("--disallowed-tools <csv>", "Comma separated disallowed tools").option("--system-prompt <text>", "Override system prompt").option("--append-system-prompt <text>", "Append additional system prompt text").option("--json", "Print JSON output").option("--stream-json", "Stream JSON chunks").option("--no-audit", "Disable tool audit log").action(async (options) => {
+program.command("chat").description("Single-turn non-interactive chat").requiredOption("-m, --message <text>", "User message").option("--mode <mode>", `Mode: ${SUPPORTED_MODES.join("|")}`, "plan").option("--model <name>", "Override model").option("--fallback-model <name>", "Fallback model on failure").option("--max-turns <n>", "Max tool turns").option("--allowed-tools <csv>", "Comma separated allowed tools").option("--disallowed-tools <csv>", "Comma separated disallowed tools").option("--system-prompt <text>", "Override system prompt").option("--append-system-prompt <text>", "Append additional system prompt text").option("--json", "Print JSON output").option("--stream-json", "Stream JSON chunks").option("--no-audit", "Disable tool audit log").action(async (options) => {
   const cfg = readConfig();
   if (!cfg) {
     process.stderr.write(
@@ -2071,7 +1888,8 @@ program.command("chat").description("Single-turn non-interactive chat").required
   const mcpConfig = loadMcpConfig(process.cwd());
   await mcpManager.ensureServers(mcpConfig);
   const mcpTools = await mcpManager.listTools();
-  const maxTurns = Number.parseInt(String(options.maxTurns), 10);
+  const resolvedFallback = cfg.maxTurns ?? DEFAULT_MAX_TURNS;
+  const maxTurns = parseMaxTurns(options.maxTurns, resolvedFallback, "chat");
   const allowedTools = String(options.allowedTools ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   const disallowedTools = String(options.disallowedTools ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   const chunks = [];
@@ -2082,11 +1900,11 @@ program.command("chat").description("Single-turn non-interactive chat").required
       cwd: process.cwd(),
       model: options.model,
       fallbackModel: options.fallbackModel,
-      maxTurns: Number.isFinite(maxTurns) ? maxTurns : 8,
+      maxTurns,
       allowedTools,
       disallowedTools,
       systemPrompt: options.systemPrompt,
-      appendSystemPrompt: [options.appendSystemPrompt ?? "", buildRuntimeMemoryPrompt(process.cwd())].filter(Boolean).join("\n\n") || void 0,
+      appendSystemPrompt: options.appendSystemPrompt,
       mcpTools,
       mcpCall: (fullName, args) => mcpManager.callTool(fullName, args),
       enableAudit: options.audit !== false
