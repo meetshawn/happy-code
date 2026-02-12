@@ -77,11 +77,15 @@ type ResolvedPolicy = {
     policyPath: string;
 };
 declare function getPolicyPath(cwd: string): string;
+declare function getGlobalPolicyPath(): string;
 declare function loadPolicy(cwd: string): ResolvedPolicy;
 declare function writeDefaultPolicy(cwd: string): string;
+declare function writeDefaultGlobalPolicy(): string;
 
 declare function getApprovalPath(): string;
-declare function clearCommandApprovals(): void;
-declare function getApprovalPrefixes(): string[];
+declare function allowGlobalCommandPrefix(prefix: string): void;
+declare function clearGlobalCommandApprovals(): void;
+declare function isGloballyApprovedCommand(command: string): boolean;
+declare function getGlobalApprovalPrefixes(): string[];
 
-export { HappyCodeAgent, SUPPORTED_MODES, clearCommandApprovals, getApprovalPath, getApprovalPrefixes, getAuditPath, getConfigPath, getModePolicy, getModePrompt, getPolicyPath, loadPolicy, readConfig, readRecentAudit, writeConfig, writeDefaultPolicy };
+export { HappyCodeAgent, SUPPORTED_MODES, allowGlobalCommandPrefix, clearGlobalCommandApprovals, getApprovalPath, getAuditPath, getConfigPath, getGlobalApprovalPrefixes, getGlobalPolicyPath, getModePolicy, getModePrompt, getPolicyPath, isGloballyApprovedCommand, loadPolicy, readConfig, readRecentAudit, writeConfig, writeDefaultGlobalPolicy, writeDefaultPolicy };

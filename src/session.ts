@@ -23,6 +23,8 @@ export type SessionRecord = {
   updatedAt: string;
   messages: ChatMessage[];
   toolEvents: SessionToolEvent[];
+  sessionApprovedCommandPrefixes?: string[];
+  oneTimeApprovedCommands?: string[];
   projectKey?: string;
   projectRoot?: string;
 };
@@ -64,7 +66,11 @@ function projectMetaFromCwd(cwd: string): { projectRoot: string; projectKey: str
 function normalizeRecord(record: SessionRecord): SessionRecord {
   return {
     ...record,
-    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : []
+    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
+    sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes)
+      ? record.sessionApprovedCommandPrefixes
+      : [],
+    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : []
   };
 }
 
@@ -123,6 +129,8 @@ export function createSession(name = 'default', cwd = process.cwd()): SessionRec
     updatedAt: nowIso(),
     messages: [],
     toolEvents: [],
+    sessionApprovedCommandPrefixes: [],
+    oneTimeApprovedCommands: [],
     projectKey: meta.projectKey,
     projectRoot: meta.projectRoot
   };
@@ -137,6 +145,10 @@ export function saveSessionRecord(record: SessionRecord): void {
     ...record,
     name: safeName(record.name),
     toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
+    sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes)
+      ? record.sessionApprovedCommandPrefixes
+      : [],
+    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
     updatedAt: nowIso()
   };
   fs.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}\n`, 'utf8');
@@ -280,6 +292,8 @@ export function forkActiveSession(name?: string, cwd = process.cwd()): SessionRe
     updatedAt: nowIso(),
     messages: [...active.messages],
     toolEvents: [...active.toolEvents],
+    sessionApprovedCommandPrefixes: [...(active.sessionApprovedCommandPrefixes ?? [])],
+    oneTimeApprovedCommands: [],
     projectKey: active.projectKey,
     projectRoot: active.projectRoot
   };
@@ -307,4 +321,75 @@ export function switchSession(id: string, cwd = process.cwd()): SessionRecord | 
   }
   setActiveSessionId(id, cwd);
   return target;
+}
+
+function normalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+export function approveCommandForSession(prefix: string, cwd = process.cwd()): void {
+  const normalized = normalizeCommand(prefix);
+  if (!normalized) {
+    return;
+  }
+  const active = loadActiveSession(cwd);
+  const list = active.sessionApprovedCommandPrefixes ?? [];
+  if (!list.includes(normalized)) {
+    active.sessionApprovedCommandPrefixes = [...list, normalized];
+    saveSessionRecord(active);
+  }
+}
+
+export function approveCommandOnce(command: string, cwd = process.cwd()): void {
+  const normalized = normalizeCommand(command);
+  if (!normalized) {
+    return;
+  }
+  const active = loadActiveSession(cwd);
+  const list = active.oneTimeApprovedCommands ?? [];
+  if (!list.includes(normalized)) {
+    active.oneTimeApprovedCommands = [...list, normalized];
+    saveSessionRecord(active);
+  }
+}
+
+export function consumeOneTimeApproval(command: string, cwd = process.cwd()): boolean {
+  const normalized = normalizeCommand(command);
+  if (!normalized) {
+    return false;
+  }
+  const active = loadActiveSession(cwd);
+  const list = active.oneTimeApprovedCommands ?? [];
+  const idx = list.indexOf(normalized);
+  if (idx < 0) {
+    return false;
+  }
+  const next = [...list.slice(0, idx), ...list.slice(idx + 1)];
+  active.oneTimeApprovedCommands = next;
+  saveSessionRecord(active);
+  return true;
+}
+
+export function isSessionApprovedCommand(command: string, cwd = process.cwd()): boolean {
+  const normalized = normalizeCommand(command);
+  const active = loadActiveSession(cwd);
+  const list = active.sessionApprovedCommandPrefixes ?? [];
+  return list.some((prefix) => normalized.startsWith(prefix));
+}
+
+export function listSessionApprovals(
+  cwd = process.cwd()
+): { once: string[]; session: string[] } {
+  const active = loadActiveSession(cwd);
+  return {
+    once: active.oneTimeApprovedCommands ?? [],
+    session: active.sessionApprovedCommandPrefixes ?? []
+  };
+}
+
+export function clearSessionApprovals(cwd = process.cwd()): void {
+  const active = loadActiveSession(cwd);
+  active.oneTimeApprovedCommands = [];
+  active.sessionApprovedCommandPrefixes = [];
+  saveSessionRecord(active);
 }

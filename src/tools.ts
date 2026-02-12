@@ -6,8 +6,9 @@ import fg from 'fast-glob';
 import type { AgentMode } from './modes.js';
 import { getModePolicy } from './modes.js';
 import { appendAudit } from './audit.js';
-import { isApprovedCommand } from './approvals.js';
+import { isGloballyApprovedCommand } from './approvals.js';
 import { isProtectedRelativePath, loadPolicy } from './policy.js';
+import { consumeOneTimeApproval, isSessionApprovedCommand } from './session.js';
 import { validateShellCommand } from './security.js';
 
 const execAsync = promisify(exec);
@@ -38,6 +39,7 @@ export type ToolCall =
   | { name: 'user_question'; args?: JsonObject };
 
 export const USER_QUESTION_PREFIX = 'NEEDS_USER_QUESTION::';
+export const APPROVAL_REQUIRED_PREFIX = 'NEEDS_APPROVAL::';
 
 function resolveInCwd(cwd: string, inputPath: string): string {
   const resolved = path.resolve(cwd, inputPath);
@@ -186,8 +188,46 @@ function audit(context: ToolRuntimeContext, call: ToolCall, ok: boolean, summary
   });
 }
 
-function needsCommandApproval(command: string): boolean {
-  return !isApprovedCommand(command);
+function normalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function sessionApprovalPrefix(command: string): string {
+  return normalizeCommand(command).split(' ').slice(0, 2).join(' ').trim();
+}
+
+function buildApprovalPayload(command: string): string {
+  const normalized = normalizeCommand(command);
+  const payload = {
+    title: 'Shell approval required',
+    question: `Allow shell command in current mode?\n${command}`,
+    types: ['single_choice'],
+    options: [
+      {
+        id: 'allow_once',
+        label: 'Allow once',
+        description: 'Allow this exact command one time.'
+      },
+      {
+        id: 'allow_session',
+        label: 'Allow session prefix',
+        description: `Allow this command prefix for current session: ${sessionApprovalPrefix(command) || normalized}`
+      },
+      {
+        id: 'deny',
+        label: 'Deny',
+        description: 'Reject and do not run command.'
+      }
+    ],
+    defaultType: 'single_choice',
+    defaultOptionId: 'deny',
+    meta: {
+      command,
+      normalized,
+      sessionPrefix: sessionApprovalPrefix(command)
+    }
+  };
+  return `${APPROVAL_REQUIRED_PREFIX}${JSON.stringify(payload)}`;
 }
 
 export async function runTool(call: ToolCall, context: ToolRuntimeContext): Promise<string> {
@@ -267,8 +307,16 @@ export async function runTool(call: ToolCall, context: ToolRuntimeContext): Prom
             audit(context, call, false, output);
             return output;
           }
-          if (needsCommandApproval(command)) {
-            output = `Approval required. Run in TUI: /allow once ${command} or /allow session ${command}`;
+          if (!consumeOneTimeApproval(command, context.cwd)) {
+            const approvedInSession = isSessionApprovedCommand(command, context.cwd);
+            const approvedGlobally = isGloballyApprovedCommand(command);
+            if (!approvedInSession && !approvedGlobally) {
+              output = buildApprovalPayload(command);
+              audit(context, call, false, 'Approval required before shell execution.');
+              return output;
+            }
+          }
+          if (output.startsWith(APPROVAL_REQUIRED_PREFIX)) {
             audit(context, call, false, output);
             return output;
           }

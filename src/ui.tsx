@@ -4,7 +4,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
 import type { HappyCodeAgent, ChatMessage, ToolEvent } from './agent.js';
-import { allowCommandPrefix, clearCommandApprovals, getApprovalPath, getApprovalPrefixes } from './approvals.js';
+import {
+  allowGlobalCommandPrefix,
+  clearGlobalCommandApprovals,
+  getApprovalPath,
+  getGlobalApprovalPrefixes
+} from './approvals.js';
 import { readRecentAudit, getAuditPath } from './audit.js';
 import { getConfigPath, readConfig } from './config.js';
 import {
@@ -18,10 +23,15 @@ import {
 import { loadMcpConfig, getMcpConfigPath, initMcpConfig } from './mcp.js';
 import type { McpClientManager } from './mcp_client.js';
 import { type AgentMode } from './modes.js';
-import { getPolicyPath, writeDefaultPolicy } from './policy.js';
+import { getGlobalPolicyPath, getPolicyPath, writeDefaultGlobalPolicy, writeDefaultPolicy } from './policy.js';
 import {
+  approveCommandForSession,
+  approveCommandOnce,
+  clearSessionApprovals,
+  listSessionApprovals,
   listSessions,
   loadActiveSession,
+  loadSessionById,
   loadSessionToolEvents,
   renameActiveSession,
   rewindActiveSession,
@@ -84,6 +94,7 @@ type UserQuestionPayload = {
   options: UserQuestionOption[];
   defaultType?: string;
   defaultOptionId?: string;
+  meta?: Record<string, unknown>;
 };
 
 type UserQuestionFocus = 'type' | 'option';
@@ -171,12 +182,16 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/mcp init', complete: '/mcp init', desc: 'Create MCP config' },
   { cmd: '/agents [prompt]', complete: '/agents ', desc: 'Run multi-agent orchestration' },
   { cmd: '/audit', complete: '/audit', desc: 'Show recent audit logs' },
-  { cmd: '/allow once <command>', complete: '/allow once ', desc: 'Approve shell command prefix quickly' },
+  { cmd: '/allow once <command>', complete: '/allow once ', desc: 'Approve exact shell command once' },
   { cmd: '/allow session <prefix>', complete: '/allow session ', desc: 'Approve shell prefix for session' },
+  { cmd: '/allow global <prefix>', complete: '/allow global ', desc: 'Approve shell prefix globally' },
   { cmd: '/approvals', complete: '/approvals', desc: 'Show command approvals' },
-  { cmd: '/approvals clear', complete: '/approvals clear', desc: 'Clear command approvals' },
+  { cmd: '/approvals clear', complete: '/approvals clear', desc: 'Clear session + one-time approvals' },
+  { cmd: '/approvals clear global', complete: '/approvals clear global', desc: 'Clear global command approvals' },
   { cmd: '/policy init', complete: '/policy init', desc: 'Create policy file' },
   { cmd: '/policy path', complete: '/policy path', desc: 'Show policy path' },
+  { cmd: '/policy global init', complete: '/policy global init', desc: 'Create global policy file' },
+  { cmd: '/policy global path', complete: '/policy global path', desc: 'Show global policy path' },
   { cmd: '/init', complete: '/init', desc: 'Show important file paths' },
   { cmd: '/clear', complete: '/clear', desc: 'Clear conversation' },
   { cmd: '/exit', complete: '/exit', desc: 'Quit' }
@@ -449,8 +464,24 @@ export function App({
       optionId: option?.id ?? '',
       optionLabel: option?.label ?? '',
       question: pendingUserQuestion.question,
-      title: pendingUserQuestion.title
+      title: pendingUserQuestion.title,
+      meta: pendingUserQuestion.meta ?? {}
     };
+
+    if (pendingUserQuestion.title === 'Shell approval required') {
+      const meta = (pendingUserQuestion.meta ?? {}) as Record<string, unknown>;
+      const command = typeof meta.command === 'string' ? meta.command : '';
+      const sessionPrefix = typeof meta.sessionPrefix === 'string' ? meta.sessionPrefix : '';
+
+      if (answer.optionId === 'allow_once' && command) {
+        approveCommandOnce(command, process.cwd());
+      } else if (answer.optionId === 'allow_session') {
+        const value = sessionPrefix || command;
+        if (value) {
+          approveCommandForSession(value, process.cwd());
+        }
+      }
+    }
 
     const resolver = pendingQuestionResolveRef.current;
     pendingQuestionResolveRef.current = null;
@@ -545,16 +576,13 @@ export function App({
 
   const openMemoryByScope = useCallback(
     async (scope: MemoryScope) => {
+      setError(null);
       const result = await openMemoryFile(scope, process.cwd());
       if (!result.ok) {
-        setError(result.message);
-        pushAssistant(`${result.message}\nPath: ${result.path}`, setHistory, onHistoryChange);
         return;
       }
-      setError(null);
-      pushAssistant(`${result.message}\nPath: ${result.path}`, setHistory, onHistoryChange);
     },
-    [onHistoryChange]
+    []
   );
 
   const confirmMemorySelection = useCallback(() => {
@@ -844,7 +872,11 @@ export function App({
                         { id: 'option_2', label: 'Need clarification', description: 'Ask user for more detail.' }
                       ],
                   defaultType: typeof payload.defaultType === 'string' ? payload.defaultType : '',
-                  defaultOptionId: typeof payload.defaultOptionId === 'string' ? payload.defaultOptionId : ''
+                  defaultOptionId: typeof payload.defaultOptionId === 'string' ? payload.defaultOptionId : '',
+                  meta:
+                    payload.meta && typeof payload.meta === 'object'
+                      ? (payload.meta as Record<string, unknown>)
+                      : undefined
                 };
 
                 const typeIndex = Math.max(0, parsed.types.findIndex((item) => item === parsed.defaultType));
@@ -1097,6 +1129,7 @@ export function App({
         const info = [
           `config: ${getConfigPath()}`,
           `policy: ${getPolicyPath(process.cwd())}`,
+          `global_policy: ${getGlobalPolicyPath()}`,
           `mcp: ${getMcpConfigPath(process.cwd())}`,
           `memory_user: ${getMemoryPath()}`,
           `memory_project: ${getProjectMemoryPath(process.cwd())}`,
@@ -1305,25 +1338,45 @@ export function App({
       }
 
       if (content === '/approvals') {
-        const list = getApprovalPrefixes();
-        const msg = list.length
-          ? `Approval prefixes:\n${list.map((s) => `- ${s}`).join('\n')}`
-          : `No session approvals. Path: ${getApprovalPath()}`;
+        const session = listSessionApprovals(process.cwd());
+        const global = getGlobalApprovalPrefixes();
+        const source = loadSessionById(loadActiveSession(process.cwd()).id);
+        const msg = [
+          `Approvals path: ${getApprovalPath()}`,
+          'One-time approvals:',
+          ...(session.once.length ? session.once.map((s) => `- ${s}`) : ['- (none)']),
+          'Session approvals:',
+          ...(session.session.length ? session.session.map((s) => `- ${s}`) : ['- (none)']),
+          'Global approvals:',
+          ...(global.length ? global.map((s) => `- ${s}`) : ['- (none)']),
+          source?.name ? `Active session: ${source.name} (${source.id})` : ''
+        ]
+          .filter(Boolean)
+          .join('\n');
         pushAssistant(msg, setHistory, onHistoryChange);
         return true;
       }
 
+      if (content === '/approvals clear global') {
+        clearGlobalCommandApprovals();
+        pushAssistant('Cleared global command approvals.', setHistory, onHistoryChange);
+        return true;
+      }
+
       if (content === '/approvals clear') {
-        clearCommandApprovals();
-        pushAssistant('Cleared saved command approvals.', setHistory, onHistoryChange);
+        clearSessionApprovals(process.cwd());
+        pushAssistant('Cleared one-time and session approvals.', setHistory, onHistoryChange);
         return true;
       }
 
       if (content.startsWith('/allow once ')) {
         const cmd = content.replace('/allow once ', '').trim();
-        const prefix = cmd.split(' ').slice(0, 2).join(' ').trim() || cmd;
-        allowCommandPrefix(prefix);
-        pushAssistant(`Approved once-like prefix: ${prefix}. You can now retry.`, setHistory, onHistoryChange);
+        if (!cmd) {
+          setError('Usage: /allow once <command>');
+        } else {
+          approveCommandOnce(cmd, process.cwd());
+          pushAssistant(`Approved one-time command: ${cmd}`, setHistory, onHistoryChange);
+        }
         return true;
       }
 
@@ -1332,8 +1385,19 @@ export function App({
         if (!prefix) {
           setError('Usage: /allow session <command-prefix>');
         } else {
-          allowCommandPrefix(prefix);
+          approveCommandForSession(prefix, process.cwd());
           pushAssistant(`Approved session prefix: ${prefix}`, setHistory, onHistoryChange);
+        }
+        return true;
+      }
+
+      if (content.startsWith('/allow global ')) {
+        const prefix = content.replace('/allow global ', '').trim();
+        if (!prefix) {
+          setError('Usage: /allow global <command-prefix>');
+        } else {
+          allowGlobalCommandPrefix(prefix);
+          pushAssistant(`Approved global prefix: ${prefix}`, setHistory, onHistoryChange);
         }
         return true;
       }
@@ -1347,6 +1411,18 @@ export function App({
       if (content === '/policy path') {
         const p = getPolicyPath(process.cwd());
         pushAssistant(`Policy path: ${p}`, setHistory, onHistoryChange);
+        return true;
+      }
+
+      if (content === '/policy global init') {
+        const p = writeDefaultGlobalPolicy();
+        pushAssistant(`Global policy initialized at: ${p}`, setHistory, onHistoryChange);
+        return true;
+      }
+
+      if (content === '/policy global path') {
+        const p = getGlobalPolicyPath();
+        pushAssistant(`Global policy path: ${p}`, setHistory, onHistoryChange);
         return true;
       }
 

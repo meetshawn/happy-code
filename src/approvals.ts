@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 type ApprovalState = {
-  approvedCommandPrefixes: string[];
+  globalApprovedCommandPrefixes: string[];
 };
 
 const APPROVAL_DIR = path.join(os.homedir(), '.happycode');
@@ -15,17 +15,20 @@ function ensureDir(): void {
 
 function readState(): ApprovalState {
   if (!fs.existsSync(APPROVAL_PATH)) {
-    return { approvedCommandPrefixes: [] };
+    return { globalApprovedCommandPrefixes: [] };
   }
   try {
     const raw = fs.readFileSync(APPROVAL_PATH, 'utf8');
-    const parsed = JSON.parse(raw) as ApprovalState;
-    if (!Array.isArray(parsed.approvedCommandPrefixes)) {
-      return { approvedCommandPrefixes: [] };
+    const parsed = JSON.parse(raw) as Partial<ApprovalState> & { approvedCommandPrefixes?: string[] };
+    if (Array.isArray(parsed.globalApprovedCommandPrefixes)) {
+      return { globalApprovedCommandPrefixes: parsed.globalApprovedCommandPrefixes };
     }
-    return parsed;
+    if (Array.isArray(parsed.approvedCommandPrefixes)) {
+      return { globalApprovedCommandPrefixes: parsed.approvedCommandPrefixes };
+    }
+    return { globalApprovedCommandPrefixes: [] };
   } catch {
-    return { approvedCommandPrefixes: [] };
+    return { globalApprovedCommandPrefixes: [] };
   }
 }
 
@@ -38,25 +41,29 @@ export function getApprovalPath(): string {
   return APPROVAL_PATH;
 }
 
-export function allowCommandPrefix(prefix: string): void {
+export function allowGlobalCommandPrefix(prefix: string): void {
   const state = readState();
-  if (!state.approvedCommandPrefixes.includes(prefix)) {
-    state.approvedCommandPrefixes.push(prefix);
+  if (!state.globalApprovedCommandPrefixes.includes(prefix)) {
+    state.globalApprovedCommandPrefixes.push(prefix);
     writeState(state);
   }
 }
 
-export function clearCommandApprovals(): void {
-  writeState({ approvedCommandPrefixes: [] });
+export function clearGlobalCommandApprovals(): void {
+  writeState({ globalApprovedCommandPrefixes: [] });
 }
 
-export function isApprovedCommand(command: string): boolean {
+export function isGloballyApprovedCommand(command: string): boolean {
   const state = readState();
   const value = command.trim().toLowerCase();
-  return state.approvedCommandPrefixes.some((prefix) => value.startsWith(prefix.toLowerCase()));
+  return state.globalApprovedCommandPrefixes.some((prefix) => value.startsWith(prefix.toLowerCase()));
 }
 
-export function getApprovalPrefixes(): string[] {
-  return readState().approvedCommandPrefixes;
+export function getGlobalApprovalPrefixes(): string[] {
+  return readState().globalApprovedCommandPrefixes;
 }
 
+export const allowCommandPrefix = allowGlobalCommandPrefix;
+export const clearCommandApprovals = clearGlobalCommandApprovals;
+export const isApprovedCommand = isGloballyApprovedCommand;
+export const getApprovalPrefixes = getGlobalApprovalPrefixes;

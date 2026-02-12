@@ -2,18 +2,39 @@
 import {
   HappyCodeAgent,
   SUPPORTED_MODES,
-  allowCommandPrefix,
-  clearCommandApprovals,
+  allowGlobalCommandPrefix,
+  approveCommandForSession,
+  approveCommandOnce,
+  clearGlobalCommandApprovals,
+  clearSession,
+  clearSessionApprovals,
+  createSession,
+  forkActiveSession,
   getApprovalPath,
-  getApprovalPrefixes,
   getAuditPath,
   getConfigPath,
+  getGlobalApprovalPrefixes,
+  getGlobalPolicyPath,
+  getLegacySessionPath,
   getPolicyPath,
+  getSessionRootPath,
+  listSessionApprovals,
+  listSessions,
+  loadActiveSession,
+  loadSessionById,
+  loadSessionMessages,
+  loadSessionToolEvents,
   readConfig,
   readRecentAudit,
+  renameActiveSession,
+  rewindActiveSession,
+  saveSessionMessages,
+  saveSessionToolEvents,
+  switchSession,
   writeConfig,
+  writeDefaultGlobalPolicy,
   writeDefaultPolicy
-} from "./chunk-QKBHKYFE.js";
+} from "./chunk-VAIDQTCK.js";
 
 // src/cli.ts
 import React2 from "react";
@@ -473,262 +494,9 @@ var McpClientManager = class {
   }
 };
 
-// src/session.ts
-import fs3 from "fs";
-import os2 from "os";
-import path3 from "path";
-import { createHash } from "crypto";
-var SESSION_ROOT = path3.join(os2.homedir(), ".happycode", "sessions");
-var ACTIVE_FILE = path3.join(SESSION_ROOT, "active-session.txt");
-var ACTIVE_MAP_FILE = path3.join(SESSION_ROOT, "active-sessions.json");
-function ensureDir() {
-  fs3.mkdirSync(SESSION_ROOT, { recursive: true });
-}
-function safeName(input) {
-  return input.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || "session";
-}
-function resolveProjectRoot(cwd) {
-  const target = path3.resolve(cwd);
-  try {
-    return fs3.realpathSync(target);
-  } catch {
-    return target;
-  }
-}
-function toProjectKey(projectRoot) {
-  const normalized = process.platform === "win32" ? projectRoot.toLowerCase() : projectRoot;
-  return createHash("sha1").update(normalized).digest("hex").slice(0, 16);
-}
-function projectMetaFromCwd(cwd) {
-  const projectRoot = resolveProjectRoot(cwd);
-  return {
-    projectRoot,
-    projectKey: toProjectKey(projectRoot)
-  };
-}
-function normalizeRecord(record) {
-  return {
-    ...record,
-    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : []
-  };
-}
-function readActiveMap() {
-  ensureDir();
-  if (!fs3.existsSync(ACTIVE_MAP_FILE)) {
-    return {};
-  }
-  try {
-    const raw = fs3.readFileSync(ACTIVE_MAP_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-function writeActiveMap(map) {
-  ensureDir();
-  fs3.writeFileSync(ACTIVE_MAP_FILE, `${JSON.stringify(map, null, 2)}
-`, "utf8");
-}
-function isProjectMatch(record, projectKey) {
-  return !record.projectKey || record.projectKey === projectKey;
-}
-function sessionPathById(id) {
-  return path3.join(SESSION_ROOT, `${id}.json`);
-}
-function nowIso() {
-  return (/* @__PURE__ */ new Date()).toISOString();
-}
-function randomId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-}
-function getSessionRootPath() {
-  ensureDir();
-  return SESSION_ROOT;
-}
-function getLegacySessionPath() {
-  return path3.join(os2.homedir(), ".happycode", "session.json");
-}
-function createSession(name = "default", cwd = process.cwd()) {
-  ensureDir();
-  const meta = projectMetaFromCwd(cwd);
-  const id = randomId();
-  const record = {
-    id,
-    name: safeName(name),
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    messages: [],
-    toolEvents: [],
-    projectKey: meta.projectKey,
-    projectRoot: meta.projectRoot
-  };
-  saveSessionRecord(record);
-  setActiveSessionId(id, cwd);
-  return record;
-}
-function saveSessionRecord(record) {
-  ensureDir();
-  const next = {
-    ...record,
-    name: safeName(record.name),
-    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
-    updatedAt: nowIso()
-  };
-  fs3.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}
-`, "utf8");
-}
-function loadSessionById(id) {
-  const p = sessionPathById(id);
-  if (!fs3.existsSync(p)) {
-    return null;
-  }
-  try {
-    const raw = fs3.readFileSync(p, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.messages)) {
-      return null;
-    }
-    return normalizeRecord(parsed);
-  } catch {
-    return null;
-  }
-}
-function listSessions(cwd = process.cwd()) {
-  ensureDir();
-  const { projectKey } = projectMetaFromCwd(cwd);
-  const files = fs3.readdirSync(SESSION_ROOT).filter((item) => item.endsWith(".json")).map((item) => path3.join(SESSION_ROOT, item));
-  const sessions = [];
-  for (const file of files) {
-    try {
-      const raw = fs3.readFileSync(file, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.messages)) {
-        const normalized = normalizeRecord(parsed);
-        if (isProjectMatch(normalized, projectKey)) {
-          sessions.push(normalized);
-        }
-      }
-    } catch {
-      continue;
-    }
-  }
-  sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  return sessions;
-}
-function setActiveSessionId(id, cwd = process.cwd()) {
-  ensureDir();
-  const { projectKey } = projectMetaFromCwd(cwd);
-  const map = readActiveMap();
-  map[projectKey] = id;
-  writeActiveMap(map);
-  fs3.writeFileSync(ACTIVE_FILE, `${id}
-`, "utf8");
-}
-function getActiveSessionId(cwd = process.cwd()) {
-  const { projectKey } = projectMetaFromCwd(cwd);
-  const map = readActiveMap();
-  const scoped = map[projectKey];
-  if (scoped) {
-    return scoped;
-  }
-  if (fs3.existsSync(ACTIVE_FILE)) {
-    try {
-      const legacyId = fs3.readFileSync(ACTIVE_FILE, "utf8").trim();
-      if (legacyId) {
-        const record = loadSessionById(legacyId);
-        if (record && isProjectMatch(record, projectKey)) {
-          map[projectKey] = legacyId;
-          writeActiveMap(map);
-          return legacyId;
-        }
-      }
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-function loadActiveSession(cwd = process.cwd()) {
-  const { projectKey } = projectMetaFromCwd(cwd);
-  const id = getActiveSessionId(cwd);
-  if (id) {
-    const record = loadSessionById(id);
-    if (record && isProjectMatch(record, projectKey)) {
-      return record;
-    }
-  }
-  return createSession("default", cwd);
-}
-function loadSessionMessages(cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  return active.messages;
-}
-function saveSessionMessages(messages, cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  active.messages = messages;
-  saveSessionRecord(active);
-}
-function loadSessionToolEvents(cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  return active.toolEvents;
-}
-function saveSessionToolEvents(events, cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  active.toolEvents = events;
-  saveSessionRecord(active);
-}
-function clearSession(cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  active.messages = [];
-  active.toolEvents = [];
-  saveSessionRecord(active);
-}
-function renameActiveSession(name, cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  active.name = safeName(name);
-  saveSessionRecord(active);
-  return active;
-}
-function forkActiveSession(name, cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  const clone = {
-    id: randomId(),
-    name: safeName(name ?? `${active.name}_fork`),
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    messages: [...active.messages],
-    toolEvents: [...active.toolEvents],
-    projectKey: active.projectKey,
-    projectRoot: active.projectRoot
-  };
-  saveSessionRecord(clone);
-  setActiveSessionId(clone.id, cwd);
-  return clone;
-}
-function rewindActiveSession(steps, cwd = process.cwd()) {
-  const active = loadActiveSession(cwd);
-  const drop = Math.max(1, steps);
-  const nextMessages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
-  const remainingUserTurns = nextMessages.filter((item) => item.role === "user").length;
-  active.messages = nextMessages;
-  active.toolEvents = active.toolEvents.filter((item) => item.turn <= remainingUserTurns);
-  saveSessionRecord(active);
-  return active;
-}
-function switchSession(id, cwd = process.cwd()) {
-  const { projectKey } = projectMetaFromCwd(cwd);
-  const target = loadSessionById(id);
-  if (!target || !isProjectMatch(target, projectKey)) {
-    return null;
-  }
-  setActiveSessionId(id, cwd);
-  return target;
-}
-
 // src/ui.tsx
-import fs4 from "fs";
-import path4 from "path";
+import fs3 from "fs";
+import path3 from "path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
@@ -790,12 +558,16 @@ var COMMANDS = [
   { cmd: "/mcp init", complete: "/mcp init", desc: "Create MCP config" },
   { cmd: "/agents [prompt]", complete: "/agents ", desc: "Run multi-agent orchestration" },
   { cmd: "/audit", complete: "/audit", desc: "Show recent audit logs" },
-  { cmd: "/allow once <command>", complete: "/allow once ", desc: "Approve shell command prefix quickly" },
+  { cmd: "/allow once <command>", complete: "/allow once ", desc: "Approve exact shell command once" },
   { cmd: "/allow session <prefix>", complete: "/allow session ", desc: "Approve shell prefix for session" },
+  { cmd: "/allow global <prefix>", complete: "/allow global ", desc: "Approve shell prefix globally" },
   { cmd: "/approvals", complete: "/approvals", desc: "Show command approvals" },
-  { cmd: "/approvals clear", complete: "/approvals clear", desc: "Clear command approvals" },
+  { cmd: "/approvals clear", complete: "/approvals clear", desc: "Clear session + one-time approvals" },
+  { cmd: "/approvals clear global", complete: "/approvals clear global", desc: "Clear global command approvals" },
   { cmd: "/policy init", complete: "/policy init", desc: "Create policy file" },
   { cmd: "/policy path", complete: "/policy path", desc: "Show policy path" },
+  { cmd: "/policy global init", complete: "/policy global init", desc: "Create global policy file" },
+  { cmd: "/policy global path", complete: "/policy global path", desc: "Show global policy path" },
   { cmd: "/init", complete: "/init", desc: "Show important file paths" },
   { cmd: "/clear", complete: "/clear", desc: "Clear conversation" },
   { cmd: "/exit", complete: "/exit", desc: "Quit" }
@@ -944,8 +716,8 @@ function parseMentionFiles(input, cwd) {
   const matches = [...input.matchAll(/@([^\s]+)/g)].map((m) => m[1]).filter(Boolean);
   const files = [];
   for (const item of matches) {
-    const full = path4.resolve(cwd, item);
-    if (fs4.existsSync(full) && fs4.statSync(full).isFile()) {
+    const full = path3.resolve(cwd, item);
+    if (fs3.existsSync(full) && fs3.statSync(full).isFile()) {
       files.push(item);
     }
   }
@@ -1006,7 +778,7 @@ function App({
   const streamingBufferRef = useRef("");
   const streamingFlushTimerRef = useRef(null);
   const themeStyle = THEME_STYLES[theme];
-  const projectName = useMemo(() => path4.basename(process.cwd()), []);
+  const projectName = useMemo(() => path3.basename(process.cwd()), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
   const flowSeparator = useMemo(() => "-".repeat(contentWidth), [contentWidth]);
   const shiftMode = useCallback(() => {
@@ -1034,8 +806,22 @@ function App({
       optionId: option?.id ?? "",
       optionLabel: option?.label ?? "",
       question: pendingUserQuestion.question,
-      title: pendingUserQuestion.title
+      title: pendingUserQuestion.title,
+      meta: pendingUserQuestion.meta ?? {}
     };
+    if (pendingUserQuestion.title === "Shell approval required") {
+      const meta = pendingUserQuestion.meta ?? {};
+      const command = typeof meta.command === "string" ? meta.command : "";
+      const sessionPrefix = typeof meta.sessionPrefix === "string" ? meta.sessionPrefix : "";
+      if (answer.optionId === "allow_once" && command) {
+        approveCommandOnce(command, process.cwd());
+      } else if (answer.optionId === "allow_session") {
+        const value = sessionPrefix || command;
+        if (value) {
+          approveCommandForSession(value, process.cwd());
+        }
+      }
+    }
     const resolver = pendingQuestionResolveRef.current;
     pendingQuestionResolveRef.current = null;
     closeUserQuestion();
@@ -1118,18 +904,13 @@ function App({
   }, []);
   const openMemoryByScope = useCallback(
     async (scope) => {
+      setError(null);
       const result = await openMemoryFile(scope, process.cwd());
       if (!result.ok) {
-        setError(result.message);
-        pushAssistant(`${result.message}
-Path: ${result.path}`, setHistory, onHistoryChange);
         return;
       }
-      setError(null);
-      pushAssistant(`${result.message}
-Path: ${result.path}`, setHistory, onHistoryChange);
     },
-    [onHistoryChange]
+    []
   );
   const confirmMemorySelection = useCallback(() => {
     const selected = memoryPickerItems[memoryPickerCursor];
@@ -1307,8 +1088,8 @@ Path: ${result.path}`, setHistory, onHistoryChange);
       let enhancedPrompt = taskPrompt;
       if (mentionFiles.length > 0) {
         const inline = mentionFiles.map((file) => {
-          const full = path4.resolve(process.cwd(), file);
-          const content = fs4.readFileSync(full, "utf8").slice(0, 2e4);
+          const full = path3.resolve(process.cwd(), file);
+          const content = fs3.readFileSync(full, "utf8").slice(0, 2e4);
           return `
 [FILE: ${file}]
 ${content}`;
@@ -1375,7 +1156,8 @@ Referenced files content:${inline}`;
                   { id: "option_2", label: "Need clarification", description: "Ask user for more detail." }
                 ],
                 defaultType: typeof payload.defaultType === "string" ? payload.defaultType : "",
-                defaultOptionId: typeof payload.defaultOptionId === "string" ? payload.defaultOptionId : ""
+                defaultOptionId: typeof payload.defaultOptionId === "string" ? payload.defaultOptionId : "",
+                meta: payload.meta && typeof payload.meta === "object" ? payload.meta : void 0
               };
               const typeIndex = Math.max(0, parsed.types.findIndex((item) => item === parsed.defaultType));
               const optionIndex = Math.max(0, parsed.options.findIndex((item) => item.id === parsed.defaultOptionId));
@@ -1520,12 +1302,12 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content === "/doctor") {
         const checks = [
-          `config_exists: ${fs4.existsSync(getConfigPath())}`,
-          `policy_exists: ${fs4.existsSync(getPolicyPath(process.cwd()))}`,
-          `mcp_exists: ${fs4.existsSync(getMcpConfigPath(process.cwd()))}`,
-          `memory_user_exists: ${fs4.existsSync(getMemoryPath())}`,
-          `memory_project_exists: ${fs4.existsSync(getProjectMemoryPath(process.cwd()))}`,
-          `audit_exists: ${fs4.existsSync(getAuditPath())}`
+          `config_exists: ${fs3.existsSync(getConfigPath())}`,
+          `policy_exists: ${fs3.existsSync(getPolicyPath(process.cwd()))}`,
+          `mcp_exists: ${fs3.existsSync(getMcpConfigPath(process.cwd()))}`,
+          `memory_user_exists: ${fs3.existsSync(getMemoryPath())}`,
+          `memory_project_exists: ${fs3.existsSync(getProjectMemoryPath(process.cwd()))}`,
+          `audit_exists: ${fs3.existsSync(getAuditPath())}`
         ].join("\n");
         pushAssistant(checks, setHistory, onHistoryChange);
         return true;
@@ -1606,6 +1388,7 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         const info = [
           `config: ${getConfigPath()}`,
           `policy: ${getPolicyPath(process.cwd())}`,
+          `global_policy: ${getGlobalPolicyPath()}`,
           `mcp: ${getMcpConfigPath(process.cwd())}`,
           `memory_user: ${getMemoryPath()}`,
           `memory_project: ${getProjectMemoryPath(process.cwd())}`,
@@ -1783,32 +1566,50 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content.startsWith("/export")) {
         const target = content.replace("/export", "").trim();
-        const outputPath = target || path4.join(process.cwd(), "happycode-export.md");
+        const outputPath = target || path3.join(process.cwd(), "happycode-export.md");
         const body = history.map((item) => `## ${item.role.toUpperCase()}
 
 ${item.content}`).join("\n\n");
-        fs4.writeFileSync(outputPath, `${body}
+        fs3.writeFileSync(outputPath, `${body}
 `, "utf8");
         pushAssistant(`Exported conversation to: ${outputPath}`, setHistory, onHistoryChange);
         return true;
       }
       if (content === "/approvals") {
-        const list = getApprovalPrefixes();
-        const msg = list.length ? `Approval prefixes:
-${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApprovalPath()}`;
+        const session = listSessionApprovals(process.cwd());
+        const global = getGlobalApprovalPrefixes();
+        const source = loadSessionById(loadActiveSession(process.cwd()).id);
+        const msg = [
+          `Approvals path: ${getApprovalPath()}`,
+          "One-time approvals:",
+          ...session.once.length ? session.once.map((s) => `- ${s}`) : ["- (none)"],
+          "Session approvals:",
+          ...session.session.length ? session.session.map((s) => `- ${s}`) : ["- (none)"],
+          "Global approvals:",
+          ...global.length ? global.map((s) => `- ${s}`) : ["- (none)"],
+          source?.name ? `Active session: ${source.name} (${source.id})` : ""
+        ].filter(Boolean).join("\n");
         pushAssistant(msg, setHistory, onHistoryChange);
         return true;
       }
+      if (content === "/approvals clear global") {
+        clearGlobalCommandApprovals();
+        pushAssistant("Cleared global command approvals.", setHistory, onHistoryChange);
+        return true;
+      }
       if (content === "/approvals clear") {
-        clearCommandApprovals();
-        pushAssistant("Cleared saved command approvals.", setHistory, onHistoryChange);
+        clearSessionApprovals(process.cwd());
+        pushAssistant("Cleared one-time and session approvals.", setHistory, onHistoryChange);
         return true;
       }
       if (content.startsWith("/allow once ")) {
         const cmd = content.replace("/allow once ", "").trim();
-        const prefix = cmd.split(" ").slice(0, 2).join(" ").trim() || cmd;
-        allowCommandPrefix(prefix);
-        pushAssistant(`Approved once-like prefix: ${prefix}. You can now retry.`, setHistory, onHistoryChange);
+        if (!cmd) {
+          setError("Usage: /allow once <command>");
+        } else {
+          approveCommandOnce(cmd, process.cwd());
+          pushAssistant(`Approved one-time command: ${cmd}`, setHistory, onHistoryChange);
+        }
         return true;
       }
       if (content.startsWith("/allow session ")) {
@@ -1816,8 +1617,18 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
         if (!prefix) {
           setError("Usage: /allow session <command-prefix>");
         } else {
-          allowCommandPrefix(prefix);
+          approveCommandForSession(prefix, process.cwd());
           pushAssistant(`Approved session prefix: ${prefix}`, setHistory, onHistoryChange);
+        }
+        return true;
+      }
+      if (content.startsWith("/allow global ")) {
+        const prefix = content.replace("/allow global ", "").trim();
+        if (!prefix) {
+          setError("Usage: /allow global <command-prefix>");
+        } else {
+          allowGlobalCommandPrefix(prefix);
+          pushAssistant(`Approved global prefix: ${prefix}`, setHistory, onHistoryChange);
         }
         return true;
       }
@@ -1829,6 +1640,16 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
       if (content === "/policy path") {
         const p = getPolicyPath(process.cwd());
         pushAssistant(`Policy path: ${p}`, setHistory, onHistoryChange);
+        return true;
+      }
+      if (content === "/policy global init") {
+        const p = writeDefaultGlobalPolicy();
+        pushAssistant(`Global policy initialized at: ${p}`, setHistory, onHistoryChange);
+        return true;
+      }
+      if (content === "/policy global path") {
+        const p = getGlobalPolicyPath();
+        pushAssistant(`Global policy path: ${p}`, setHistory, onHistoryChange);
         return true;
       }
       return false;
@@ -2425,9 +2246,14 @@ program.command("audit").description("Audit log helpers").option("--path", "Prin
   process.stdout.write(`${JSON.stringify(records, null, 2)}
 `);
 });
-program.command("policy").description("Policy file helpers").option("--path", "Print policy file path").option("--init", "Create default policy file if missing").action((options) => {
+program.command("policy").description("Policy file helpers").option("--path", "Print policy file path").option("--global-path", "Print global policy file path").option("--init", "Create default policy file if missing").option("--global-init", "Create default global policy file if missing").action((options) => {
   if (options.path) {
     process.stdout.write(`${getPolicyPath(process.cwd())}
+`);
+    return;
+  }
+  if (options.globalPath) {
+    process.stdout.write(`${getGlobalPolicyPath()}
 `);
     return;
   }
@@ -2437,25 +2263,31 @@ program.command("policy").description("Policy file helpers").option("--path", "P
 `);
     return;
   }
-  process.stdout.write("Use --path or --init\n");
+  if (options.globalInit) {
+    const p = writeDefaultGlobalPolicy();
+    process.stdout.write(`Global policy ready: ${p}
+`);
+    return;
+  }
+  process.stdout.write("Use --path, --global-path, --init, or --global-init\n");
 });
-program.command("approvals").description("Command approval helpers").option("--path", "Print approvals storage path").option("--list", "List approved prefixes").option("--clear", "Clear approved prefixes").action((options) => {
+program.command("approvals").description("Command approval helpers").option("--path", "Print approvals storage path").option("--list", "List global approved prefixes").option("--list-global", "List global approved prefixes").option("--clear", "Clear global approved prefixes").option("--clear-global", "Clear global approved prefixes").action((options) => {
   if (options.path) {
     process.stdout.write(`${getApprovalPath()}
 `);
     return;
   }
-  if (options.list) {
-    process.stdout.write(`${JSON.stringify(getApprovalPrefixes(), null, 2)}
+  if (options.list || options.listGlobal) {
+    process.stdout.write(`${JSON.stringify(getGlobalApprovalPrefixes(), null, 2)}
 `);
     return;
   }
-  if (options.clear) {
-    clearCommandApprovals();
+  if (options.clear || options.clearGlobal) {
+    clearGlobalCommandApprovals();
     process.stdout.write("Cleared approvals.\n");
     return;
   }
-  process.stdout.write("Use --path, --list, or --clear\n");
+  process.stdout.write("Use --path, --list, --list-global, --clear, or --clear-global\n");
 });
 if (process.argv.length === 2) {
   process.argv.push("run");

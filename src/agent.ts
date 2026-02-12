@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import type { HappyCodeConfig } from './config.js';
 import { getModePrompt, type AgentMode } from './modes.js';
-import { TOOL_SCHEMA, runTool, USER_QUESTION_PREFIX, type ToolCall } from './tools.js';
+import { APPROVAL_REQUIRED_PREFIX, TOOL_SCHEMA, runTool, USER_QUESTION_PREFIX, type ToolCall } from './tools.js';
 import type { McpToolDescriptor } from './mcp_client.js';
 
 export type ChatMessage = {
@@ -217,8 +217,12 @@ export class HappyCodeAgent {
         }
 
         let questionPayload: Record<string, unknown> | undefined;
-        if (toolName === 'user_question' && result.startsWith(USER_QUESTION_PREFIX)) {
-          const raw = result.slice(USER_QUESTION_PREFIX.length);
+        const isUserQuestion = result.startsWith(USER_QUESTION_PREFIX);
+        const isApprovalQuestion = result.startsWith(APPROVAL_REQUIRED_PREFIX);
+        if (isUserQuestion || isApprovalQuestion) {
+          const raw = isUserQuestion
+            ? result.slice(USER_QUESTION_PREFIX.length)
+            : result.slice(APPROVAL_REQUIRED_PREFIX.length);
           try {
             questionPayload = JSON.parse(raw) as Record<string, unknown>;
           } catch {

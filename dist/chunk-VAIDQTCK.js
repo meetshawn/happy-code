@@ -4,7 +4,7 @@ function getModePolicy(mode) {
     case "plan":
       return { allowWrite: false, allowExec: false };
     case "edit":
-      return { allowWrite: true, allowExec: false };
+      return { allowWrite: true, allowExec: true };
     case "auto":
       return { allowWrite: true, allowExec: true };
     default:
@@ -22,7 +22,7 @@ function getModePrompt(mode) {
         "You may inspect files, but do not modify files or run shell commands."
       ].join(" ");
     case "edit":
-      return "Mode=edit. You may inspect and edit project files to complete tasks. Do not run shell commands. If uncertain, call user_question for explicit user choice.";
+      return "Mode=edit. You may inspect/edit project files and run shell commands when required. Shell commands remain subject to runtime safety policy and user approval prompts. If uncertain, call user_question for explicit user choice.";
     case "auto":
       return "Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice.";
     default:
@@ -77,17 +77,20 @@ function ensureDir2() {
 }
 function readState() {
   if (!fs2.existsSync(APPROVAL_PATH)) {
-    return { approvedCommandPrefixes: [] };
+    return { globalApprovedCommandPrefixes: [] };
   }
   try {
     const raw = fs2.readFileSync(APPROVAL_PATH, "utf8");
     const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.approvedCommandPrefixes)) {
-      return { approvedCommandPrefixes: [] };
+    if (Array.isArray(parsed.globalApprovedCommandPrefixes)) {
+      return { globalApprovedCommandPrefixes: parsed.globalApprovedCommandPrefixes };
     }
-    return parsed;
+    if (Array.isArray(parsed.approvedCommandPrefixes)) {
+      return { globalApprovedCommandPrefixes: parsed.approvedCommandPrefixes };
+    }
+    return { globalApprovedCommandPrefixes: [] };
   } catch {
-    return { approvedCommandPrefixes: [] };
+    return { globalApprovedCommandPrefixes: [] };
   }
 }
 function writeState(state) {
@@ -98,27 +101,28 @@ function writeState(state) {
 function getApprovalPath() {
   return APPROVAL_PATH;
 }
-function allowCommandPrefix(prefix) {
+function allowGlobalCommandPrefix(prefix) {
   const state = readState();
-  if (!state.approvedCommandPrefixes.includes(prefix)) {
-    state.approvedCommandPrefixes.push(prefix);
+  if (!state.globalApprovedCommandPrefixes.includes(prefix)) {
+    state.globalApprovedCommandPrefixes.push(prefix);
     writeState(state);
   }
 }
-function clearCommandApprovals() {
-  writeState({ approvedCommandPrefixes: [] });
+function clearGlobalCommandApprovals() {
+  writeState({ globalApprovedCommandPrefixes: [] });
 }
-function isApprovedCommand(command) {
+function isGloballyApprovedCommand(command) {
   const state = readState();
   const value = command.trim().toLowerCase();
-  return state.approvedCommandPrefixes.some((prefix) => value.startsWith(prefix.toLowerCase()));
+  return state.globalApprovedCommandPrefixes.some((prefix) => value.startsWith(prefix.toLowerCase()));
 }
-function getApprovalPrefixes() {
-  return readState().approvedCommandPrefixes;
+function getGlobalApprovalPrefixes() {
+  return readState().globalApprovedCommandPrefixes;
 }
 
 // src/policy.ts
 import fs3 from "fs";
+import os3 from "os";
 import path3 from "path";
 var DEFAULT_ALLOW_PREFIXES = [
   "git status",
@@ -158,8 +162,25 @@ var DEFAULT_DENY_PATTERNS = [
   "(^|\\s)git\\s+reset\\s+--hard\\b"
 ];
 var DEFAULT_PROTECTED_PATHS = [".git", "node_modules"];
+var GLOBAL_POLICY_DIR = path3.join(os3.homedir(), ".happycode");
+var GLOBAL_POLICY_PATH = path3.join(GLOBAL_POLICY_DIR, "policy.json");
+function mergeUnique(values) {
+  return [...new Set(values.map((item) => item.trim()).filter(Boolean))];
+}
+function resolveField(projectValue, globalValue, fallback) {
+  if (Array.isArray(projectValue)) {
+    return mergeUnique(projectValue);
+  }
+  if (Array.isArray(globalValue)) {
+    return mergeUnique(globalValue);
+  }
+  return [...fallback];
+}
 function getPolicyPath(cwd) {
   return path3.join(cwd, ".happycode-policy.json");
+}
+function getGlobalPolicyPath() {
+  return GLOBAL_POLICY_PATH;
 }
 function readPolicyFile(policyPath) {
   if (!fs3.existsSync(policyPath)) {
@@ -174,12 +195,13 @@ function readPolicyFile(policyPath) {
 }
 function loadPolicy(cwd) {
   const policyPath = getPolicyPath(cwd);
-  const raw = readPolicyFile(policyPath);
+  const rawProject = readPolicyFile(policyPath);
+  const rawGlobal = readPolicyFile(getGlobalPolicyPath());
   return {
     policyPath,
-    allowShellPrefixes: raw.allowShellPrefixes ?? DEFAULT_ALLOW_PREFIXES,
-    denyShellPatterns: raw.denyShellPatterns ?? DEFAULT_DENY_PATTERNS,
-    protectedPaths: raw.protectedPaths ?? DEFAULT_PROTECTED_PATHS
+    allowShellPrefixes: resolveField(rawProject.allowShellPrefixes, rawGlobal.allowShellPrefixes, DEFAULT_ALLOW_PREFIXES),
+    denyShellPatterns: resolveField(rawProject.denyShellPatterns, rawGlobal.denyShellPatterns, DEFAULT_DENY_PATTERNS),
+    protectedPaths: resolveField(rawProject.protectedPaths, rawGlobal.protectedPaths, DEFAULT_PROTECTED_PATHS)
   };
 }
 function writeDefaultPolicy(cwd) {
@@ -187,6 +209,21 @@ function writeDefaultPolicy(cwd) {
   if (fs3.existsSync(policyPath)) {
     return policyPath;
   }
+  const sample = {
+    allowShellPrefixes: DEFAULT_ALLOW_PREFIXES,
+    denyShellPatterns: DEFAULT_DENY_PATTERNS,
+    protectedPaths: DEFAULT_PROTECTED_PATHS
+  };
+  fs3.writeFileSync(policyPath, `${JSON.stringify(sample, null, 2)}
+`, "utf8");
+  return policyPath;
+}
+function writeDefaultGlobalPolicy() {
+  const policyPath = getGlobalPolicyPath();
+  if (fs3.existsSync(policyPath)) {
+    return policyPath;
+  }
+  fs3.mkdirSync(path3.dirname(policyPath), { recursive: true });
   const sample = {
     allowShellPrefixes: DEFAULT_ALLOW_PREFIXES,
     denyShellPatterns: DEFAULT_DENY_PATTERNS,
@@ -204,12 +241,335 @@ function isProtectedRelativePath(relPath, policy) {
   });
 }
 
+// src/session.ts
+import fs4 from "fs";
+import os4 from "os";
+import path4 from "path";
+import { createHash } from "crypto";
+var SESSION_ROOT = path4.join(os4.homedir(), ".happycode", "sessions");
+var ACTIVE_FILE = path4.join(SESSION_ROOT, "active-session.txt");
+var ACTIVE_MAP_FILE = path4.join(SESSION_ROOT, "active-sessions.json");
+function ensureDir3() {
+  fs4.mkdirSync(SESSION_ROOT, { recursive: true });
+}
+function safeName(input) {
+  return input.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || "session";
+}
+function resolveProjectRoot(cwd) {
+  const target = path4.resolve(cwd);
+  try {
+    return fs4.realpathSync(target);
+  } catch {
+    return target;
+  }
+}
+function toProjectKey(projectRoot) {
+  const normalized = process.platform === "win32" ? projectRoot.toLowerCase() : projectRoot;
+  return createHash("sha1").update(normalized).digest("hex").slice(0, 16);
+}
+function projectMetaFromCwd(cwd) {
+  const projectRoot = resolveProjectRoot(cwd);
+  return {
+    projectRoot,
+    projectKey: toProjectKey(projectRoot)
+  };
+}
+function normalizeRecord(record) {
+  return {
+    ...record,
+    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
+    sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes) ? record.sessionApprovedCommandPrefixes : [],
+    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : []
+  };
+}
+function readActiveMap() {
+  ensureDir3();
+  if (!fs4.existsSync(ACTIVE_MAP_FILE)) {
+    return {};
+  }
+  try {
+    const raw = fs4.readFileSync(ACTIVE_MAP_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function writeActiveMap(map) {
+  ensureDir3();
+  fs4.writeFileSync(ACTIVE_MAP_FILE, `${JSON.stringify(map, null, 2)}
+`, "utf8");
+}
+function isProjectMatch(record, projectKey) {
+  return !record.projectKey || record.projectKey === projectKey;
+}
+function sessionPathById(id) {
+  return path4.join(SESSION_ROOT, `${id}.json`);
+}
+function nowIso() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function randomId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+function getSessionRootPath() {
+  ensureDir3();
+  return SESSION_ROOT;
+}
+function getLegacySessionPath() {
+  return path4.join(os4.homedir(), ".happycode", "session.json");
+}
+function createSession(name = "default", cwd = process.cwd()) {
+  ensureDir3();
+  const meta = projectMetaFromCwd(cwd);
+  const id = randomId();
+  const record = {
+    id,
+    name: safeName(name),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [],
+    toolEvents: [],
+    sessionApprovedCommandPrefixes: [],
+    oneTimeApprovedCommands: [],
+    projectKey: meta.projectKey,
+    projectRoot: meta.projectRoot
+  };
+  saveSessionRecord(record);
+  setActiveSessionId(id, cwd);
+  return record;
+}
+function saveSessionRecord(record) {
+  ensureDir3();
+  const next = {
+    ...record,
+    name: safeName(record.name),
+    toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
+    sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes) ? record.sessionApprovedCommandPrefixes : [],
+    oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
+    updatedAt: nowIso()
+  };
+  fs4.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}
+`, "utf8");
+}
+function loadSessionById(id) {
+  const p = sessionPathById(id);
+  if (!fs4.existsSync(p)) {
+    return null;
+  }
+  try {
+    const raw = fs4.readFileSync(p, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.messages)) {
+      return null;
+    }
+    return normalizeRecord(parsed);
+  } catch {
+    return null;
+  }
+}
+function listSessions(cwd = process.cwd()) {
+  ensureDir3();
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const files = fs4.readdirSync(SESSION_ROOT).filter((item) => item.endsWith(".json")).map((item) => path4.join(SESSION_ROOT, item));
+  const sessions = [];
+  for (const file of files) {
+    try {
+      const raw = fs4.readFileSync(file, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.messages)) {
+        const normalized = normalizeRecord(parsed);
+        if (isProjectMatch(normalized, projectKey)) {
+          sessions.push(normalized);
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+  sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return sessions;
+}
+function setActiveSessionId(id, cwd = process.cwd()) {
+  ensureDir3();
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const map = readActiveMap();
+  map[projectKey] = id;
+  writeActiveMap(map);
+  fs4.writeFileSync(ACTIVE_FILE, `${id}
+`, "utf8");
+}
+function getActiveSessionId(cwd = process.cwd()) {
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const map = readActiveMap();
+  const scoped = map[projectKey];
+  if (scoped) {
+    return scoped;
+  }
+  if (fs4.existsSync(ACTIVE_FILE)) {
+    try {
+      const legacyId = fs4.readFileSync(ACTIVE_FILE, "utf8").trim();
+      if (legacyId) {
+        const record = loadSessionById(legacyId);
+        if (record && isProjectMatch(record, projectKey)) {
+          map[projectKey] = legacyId;
+          writeActiveMap(map);
+          return legacyId;
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+function loadActiveSession(cwd = process.cwd()) {
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const id = getActiveSessionId(cwd);
+  if (id) {
+    const record = loadSessionById(id);
+    if (record && isProjectMatch(record, projectKey)) {
+      return record;
+    }
+  }
+  return createSession("default", cwd);
+}
+function loadSessionMessages(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  return active.messages;
+}
+function saveSessionMessages(messages, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.messages = messages;
+  saveSessionRecord(active);
+}
+function loadSessionToolEvents(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  return active.toolEvents;
+}
+function saveSessionToolEvents(events, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.toolEvents = events;
+  saveSessionRecord(active);
+}
+function clearSession(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.messages = [];
+  active.toolEvents = [];
+  saveSessionRecord(active);
+}
+function renameActiveSession(name, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.name = safeName(name);
+  saveSessionRecord(active);
+  return active;
+}
+function forkActiveSession(name, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  const clone = {
+    id: randomId(),
+    name: safeName(name ?? `${active.name}_fork`),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    messages: [...active.messages],
+    toolEvents: [...active.toolEvents],
+    sessionApprovedCommandPrefixes: [...active.sessionApprovedCommandPrefixes ?? []],
+    oneTimeApprovedCommands: [],
+    projectKey: active.projectKey,
+    projectRoot: active.projectRoot
+  };
+  saveSessionRecord(clone);
+  setActiveSessionId(clone.id, cwd);
+  return clone;
+}
+function rewindActiveSession(steps, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  const drop = Math.max(1, steps);
+  const nextMessages = active.messages.slice(0, Math.max(0, active.messages.length - drop));
+  const remainingUserTurns = nextMessages.filter((item) => item.role === "user").length;
+  active.messages = nextMessages;
+  active.toolEvents = active.toolEvents.filter((item) => item.turn <= remainingUserTurns);
+  saveSessionRecord(active);
+  return active;
+}
+function switchSession(id, cwd = process.cwd()) {
+  const { projectKey } = projectMetaFromCwd(cwd);
+  const target = loadSessionById(id);
+  if (!target || !isProjectMatch(target, projectKey)) {
+    return null;
+  }
+  setActiveSessionId(id, cwd);
+  return target;
+}
+function normalizeCommand(command) {
+  return command.trim().replace(/\s+/g, " ").toLowerCase();
+}
+function approveCommandForSession(prefix, cwd = process.cwd()) {
+  const normalized = normalizeCommand(prefix);
+  if (!normalized) {
+    return;
+  }
+  const active = loadActiveSession(cwd);
+  const list = active.sessionApprovedCommandPrefixes ?? [];
+  if (!list.includes(normalized)) {
+    active.sessionApprovedCommandPrefixes = [...list, normalized];
+    saveSessionRecord(active);
+  }
+}
+function approveCommandOnce(command, cwd = process.cwd()) {
+  const normalized = normalizeCommand(command);
+  if (!normalized) {
+    return;
+  }
+  const active = loadActiveSession(cwd);
+  const list = active.oneTimeApprovedCommands ?? [];
+  if (!list.includes(normalized)) {
+    active.oneTimeApprovedCommands = [...list, normalized];
+    saveSessionRecord(active);
+  }
+}
+function consumeOneTimeApproval(command, cwd = process.cwd()) {
+  const normalized = normalizeCommand(command);
+  if (!normalized) {
+    return false;
+  }
+  const active = loadActiveSession(cwd);
+  const list = active.oneTimeApprovedCommands ?? [];
+  const idx = list.indexOf(normalized);
+  if (idx < 0) {
+    return false;
+  }
+  const next = [...list.slice(0, idx), ...list.slice(idx + 1)];
+  active.oneTimeApprovedCommands = next;
+  saveSessionRecord(active);
+  return true;
+}
+function isSessionApprovedCommand(command, cwd = process.cwd()) {
+  const normalized = normalizeCommand(command);
+  const active = loadActiveSession(cwd);
+  const list = active.sessionApprovedCommandPrefixes ?? [];
+  return list.some((prefix) => normalized.startsWith(prefix));
+}
+function listSessionApprovals(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  return {
+    once: active.oneTimeApprovedCommands ?? [],
+    session: active.sessionApprovedCommandPrefixes ?? []
+  };
+}
+function clearSessionApprovals(cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  active.oneTimeApprovedCommands = [];
+  active.sessionApprovedCommandPrefixes = [];
+  saveSessionRecord(active);
+}
+
 // src/agent.ts
 import OpenAI from "openai";
 
 // src/tools.ts
-import fs4 from "fs";
-import path4 from "path";
+import fs5 from "fs";
+import path5 from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
 import fg from "fast-glob";
@@ -243,16 +603,17 @@ var execAsync = promisify(exec);
 var MAX_READ = 3e4;
 var MAX_OUTPUT = 2e4;
 var USER_QUESTION_PREFIX = "NEEDS_USER_QUESTION::";
+var APPROVAL_REQUIRED_PREFIX = "NEEDS_APPROVAL::";
 function resolveInCwd(cwd, inputPath) {
-  const resolved = path4.resolve(cwd, inputPath);
-  const normalizedCwd = path4.resolve(cwd) + path4.sep;
-  if (resolved !== path4.resolve(cwd) && !resolved.startsWith(normalizedCwd)) {
+  const resolved = path5.resolve(cwd, inputPath);
+  const normalizedCwd = path5.resolve(cwd) + path5.sep;
+  if (resolved !== path5.resolve(cwd) && !resolved.startsWith(normalizedCwd)) {
     throw new Error("Path escapes current workspace.");
   }
   return resolved;
 }
 function toRelative(cwd, fullPath) {
-  return path4.relative(cwd, fullPath).replace(/\\/g, "/");
+  return path5.relative(cwd, fullPath).replace(/\\/g, "/");
 }
 function clampOutput(text, limit = MAX_OUTPUT) {
   if (text.length <= limit) {
@@ -290,7 +651,7 @@ async function listFiles(cwd, pattern = "**/*") {
 }
 function readFile(cwd, filePath) {
   const fullPath = resolveInCwd(cwd, filePath);
-  const content = fs4.readFileSync(fullPath, "utf8");
+  const content = fs5.readFileSync(fullPath, "utf8");
   return clampOutput(content, MAX_READ);
 }
 function assertWritable(cwd, filePath, mode) {
@@ -307,35 +668,35 @@ function assertWritable(cwd, filePath, mode) {
 function writeFile(cwd, filePath, content, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  fs4.mkdirSync(path4.dirname(fullPath), { recursive: true });
-  fs4.writeFileSync(fullPath, content, "utf8");
+  fs5.mkdirSync(path5.dirname(fullPath), { recursive: true });
+  fs5.writeFileSync(fullPath, content, "utf8");
   return `Wrote ${filePath}`;
 }
 function appendFile(cwd, filePath, content, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  fs4.mkdirSync(path4.dirname(fullPath), { recursive: true });
-  fs4.appendFileSync(fullPath, content, "utf8");
+  fs5.mkdirSync(path5.dirname(fullPath), { recursive: true });
+  fs5.appendFileSync(fullPath, content, "utf8");
   return `Appended ${filePath}`;
 }
 function patchFile(cwd, filePath, findText, replaceText, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  const source = fs4.readFileSync(fullPath, "utf8");
+  const source = fs5.readFileSync(fullPath, "utf8");
   if (!source.includes(findText)) {
     return `Pattern not found in ${filePath}`;
   }
   const next = source.replace(findText, replaceText);
-  fs4.writeFileSync(fullPath, next, "utf8");
+  fs5.writeFileSync(fullPath, next, "utf8");
   return `Patched ${filePath}`;
 }
 function deleteFile(cwd, filePath, mode) {
   assertWritable(cwd, filePath, mode);
   const fullPath = resolveInCwd(cwd, filePath);
-  if (!fs4.existsSync(fullPath)) {
+  if (!fs5.existsSync(fullPath)) {
     return `File does not exist: ${filePath}`;
   }
-  fs4.unlinkSync(fullPath);
+  fs5.unlinkSync(fullPath);
   return `Deleted ${filePath}`;
 }
 function searchInFiles(cwd, pattern, glob = "**/*.{ts,tsx,js,jsx,py,go,rs,java,md,json,yml,yaml}") {
@@ -347,7 +708,7 @@ function searchInFiles(cwd, pattern, glob = "**/*.{ts,tsx,js,jsx,py,go,rs,java,m
   });
   const results = [];
   for (const file of files.slice(0, 700)) {
-    const content = fs4.readFileSync(path4.join(cwd, file), "utf8");
+    const content = fs5.readFileSync(path5.join(cwd, file), "utf8");
     const lines = content.split(/\r?\n/);
     lines.forEach((line, idx) => {
       if (line.includes(pattern)) {
@@ -373,8 +734,45 @@ function audit(context, call, ok, summary) {
     summary
   });
 }
-function needsCommandApproval(command) {
-  return !isApprovedCommand(command);
+function normalizeCommand2(command) {
+  return command.trim().replace(/\s+/g, " ").toLowerCase();
+}
+function sessionApprovalPrefix(command) {
+  return normalizeCommand2(command).split(" ").slice(0, 2).join(" ").trim();
+}
+function buildApprovalPayload(command) {
+  const normalized = normalizeCommand2(command);
+  const payload = {
+    title: "Shell approval required",
+    question: `Allow shell command in current mode?
+${command}`,
+    types: ["single_choice"],
+    options: [
+      {
+        id: "allow_once",
+        label: "Allow once",
+        description: "Allow this exact command one time."
+      },
+      {
+        id: "allow_session",
+        label: "Allow session prefix",
+        description: `Allow this command prefix for current session: ${sessionApprovalPrefix(command) || normalized}`
+      },
+      {
+        id: "deny",
+        label: "Deny",
+        description: "Reject and do not run command."
+      }
+    ],
+    defaultType: "single_choice",
+    defaultOptionId: "deny",
+    meta: {
+      command,
+      normalized,
+      sessionPrefix: sessionApprovalPrefix(command)
+    }
+  };
+  return `${APPROVAL_REQUIRED_PREFIX}${JSON.stringify(payload)}`;
 }
 async function runTool(call, context) {
   const policy = getModePolicy(context.mode);
@@ -449,8 +847,16 @@ async function runTool(call, context) {
             audit(context, call, false, output);
             return output;
           }
-          if (needsCommandApproval(command)) {
-            output = `Approval required. Run in TUI: /allow once ${command} or /allow session ${command}`;
+          if (!consumeOneTimeApproval(command, context.cwd)) {
+            const approvedInSession = isSessionApprovedCommand(command, context.cwd);
+            const approvedGlobally = isGloballyApprovedCommand(command);
+            if (!approvedInSession && !approvedGlobally) {
+              output = buildApprovalPayload(command);
+              audit(context, call, false, "Approval required before shell execution.");
+              return output;
+            }
+          }
+          if (output.startsWith(APPROVAL_REQUIRED_PREFIX)) {
             audit(context, call, false, output);
             return output;
           }
@@ -827,8 +1233,10 @@ var HappyCodeAgent = class {
           );
         }
         let questionPayload;
-        if (toolName === "user_question" && result.startsWith(USER_QUESTION_PREFIX)) {
-          const raw = result.slice(USER_QUESTION_PREFIX.length);
+        const isUserQuestion = result.startsWith(USER_QUESTION_PREFIX);
+        const isApprovalQuestion = result.startsWith(APPROVAL_REQUIRED_PREFIX);
+        if (isUserQuestion || isApprovalQuestion) {
+          const raw = isUserQuestion ? result.slice(USER_QUESTION_PREFIX.length) : result.slice(APPROVAL_REQUIRED_PREFIX.length);
           try {
             questionPayload = JSON.parse(raw);
           } catch {
@@ -881,22 +1289,22 @@ var HappyCodeAgent = class {
 };
 
 // src/config.ts
-import fs5 from "fs";
-import os3 from "os";
-import path5 from "path";
-var CONFIG_DIR = path5.join(os3.homedir(), ".happycode");
-var CONFIG_PATH = path5.join(CONFIG_DIR, "config.json");
+import fs6 from "fs";
+import os5 from "os";
+import path6 from "path";
+var CONFIG_DIR = path6.join(os5.homedir(), ".happycode");
+var CONFIG_PATH = path6.join(CONFIG_DIR, "config.json");
 function getConfigPath() {
   return CONFIG_PATH;
 }
 function ensureConfigDir() {
-  fs5.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs6.mkdirSync(CONFIG_DIR, { recursive: true });
 }
 function readConfig() {
-  if (!fs5.existsSync(CONFIG_PATH)) {
+  if (!fs6.existsSync(CONFIG_PATH)) {
     return null;
   }
-  const raw = fs5.readFileSync(CONFIG_PATH, "utf8");
+  const raw = fs6.readFileSync(CONFIG_PATH, "utf8");
   const parsed = JSON.parse(raw);
   if (!parsed.baseUrl || !parsed.apiKey) {
     return null;
@@ -909,7 +1317,7 @@ function readConfig() {
 }
 function writeConfig(config) {
   ensureConfigDir();
-  fs5.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
+  fs6.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
 `, "utf8");
 }
 
@@ -920,12 +1328,34 @@ export {
   getAuditPath,
   readRecentAudit,
   getApprovalPath,
-  allowCommandPrefix,
-  clearCommandApprovals,
-  getApprovalPrefixes,
+  allowGlobalCommandPrefix,
+  clearGlobalCommandApprovals,
+  isGloballyApprovedCommand,
+  getGlobalApprovalPrefixes,
   getPolicyPath,
+  getGlobalPolicyPath,
   loadPolicy,
   writeDefaultPolicy,
+  writeDefaultGlobalPolicy,
+  getSessionRootPath,
+  getLegacySessionPath,
+  createSession,
+  loadSessionById,
+  listSessions,
+  loadActiveSession,
+  loadSessionMessages,
+  saveSessionMessages,
+  loadSessionToolEvents,
+  saveSessionToolEvents,
+  clearSession,
+  renameActiveSession,
+  forkActiveSession,
+  rewindActiveSession,
+  switchSession,
+  approveCommandForSession,
+  approveCommandOnce,
+  listSessionApprovals,
+  clearSessionApprovals,
   HappyCodeAgent,
   getConfigPath,
   readConfig,

@@ -10,7 +10,7 @@ export function getModePolicy(mode: AgentMode): ModePolicy {
     case 'plan':
       return { allowWrite: false, allowExec: false };
     case 'edit':
-      return { allowWrite: true, allowExec: false };
+      return { allowWrite: true, allowExec: true };
     case 'auto':
       return { allowWrite: true, allowExec: true };
     default:
@@ -29,7 +29,7 @@ export function getModePrompt(mode: AgentMode): string {
         'You may inspect files, but do not modify files or run shell commands.'
       ].join(' ');
     case 'edit':
-      return 'Mode=edit. You may inspect and edit project files to complete tasks. Do not run shell commands. If uncertain, call user_question for explicit user choice.';
+      return 'Mode=edit. You may inspect/edit project files and run shell commands when required. Shell commands remain subject to runtime safety policy and user approval prompts. If uncertain, call user_question for explicit user choice.';
     case 'auto':
       return 'Mode=auto. You may inspect/edit files and run shell commands when required. If uncertain, call user_question for explicit user choice.';
     default:

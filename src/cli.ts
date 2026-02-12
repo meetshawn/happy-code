@@ -4,14 +4,14 @@ import { Command } from 'commander';
 import { render } from 'ink';
 import { HappyCodeAgent } from './agent.js';
 import { MultiAgentRuntime } from './agents_runtime.js';
-import { clearCommandApprovals, getApprovalPath, getApprovalPrefixes } from './approvals.js';
+import { clearGlobalCommandApprovals, getApprovalPath, getGlobalApprovalPrefixes } from './approvals.js';
 import { getAuditPath, readRecentAudit } from './audit.js';
 import { getConfigPath, readConfig, writeConfig } from './config.js';
 import { buildRuntimeMemoryPrompt } from './memory.js';
 import { SUPPORTED_MODES, type AgentMode } from './modes.js';
 import { loadMcpConfig } from './mcp.js';
 import { McpClientManager } from './mcp_client.js';
-import { getPolicyPath, writeDefaultPolicy } from './policy.js';
+import { getGlobalPolicyPath, getPolicyPath, writeDefaultGlobalPolicy, writeDefaultPolicy } from './policy.js';
 import {
   clearSession,
   createSession,
@@ -375,10 +375,16 @@ program
   .command('policy')
   .description('Policy file helpers')
   .option('--path', 'Print policy file path')
+  .option('--global-path', 'Print global policy file path')
   .option('--init', 'Create default policy file if missing')
+  .option('--global-init', 'Create default global policy file if missing')
   .action((options) => {
     if (options.path) {
       process.stdout.write(`${getPolicyPath(process.cwd())}\n`);
+      return;
+    }
+    if (options.globalPath) {
+      process.stdout.write(`${getGlobalPolicyPath()}\n`);
       return;
     }
     if (options.init) {
@@ -386,30 +392,37 @@ program
       process.stdout.write(`Policy ready: ${p}\n`);
       return;
     }
-    process.stdout.write('Use --path or --init\n');
+    if (options.globalInit) {
+      const p = writeDefaultGlobalPolicy();
+      process.stdout.write(`Global policy ready: ${p}\n`);
+      return;
+    }
+    process.stdout.write('Use --path, --global-path, --init, or --global-init\n');
   });
 
 program
   .command('approvals')
   .description('Command approval helpers')
   .option('--path', 'Print approvals storage path')
-  .option('--list', 'List approved prefixes')
-  .option('--clear', 'Clear approved prefixes')
+  .option('--list', 'List global approved prefixes')
+  .option('--list-global', 'List global approved prefixes')
+  .option('--clear', 'Clear global approved prefixes')
+  .option('--clear-global', 'Clear global approved prefixes')
   .action((options) => {
     if (options.path) {
       process.stdout.write(`${getApprovalPath()}\n`);
       return;
     }
-    if (options.list) {
-      process.stdout.write(`${JSON.stringify(getApprovalPrefixes(), null, 2)}\n`);
+    if (options.list || options.listGlobal) {
+      process.stdout.write(`${JSON.stringify(getGlobalApprovalPrefixes(), null, 2)}\n`);
       return;
     }
-    if (options.clear) {
-      clearCommandApprovals();
+    if (options.clear || options.clearGlobal) {
+      clearGlobalCommandApprovals();
       process.stdout.write('Cleared approvals.\n');
       return;
     }
-    process.stdout.write('Use --path, --list, or --clear\n');
+    process.stdout.write('Use --path, --list, --list-global, --clear, or --clear-global\n');
   });
 
 if (process.argv.length === 2) {

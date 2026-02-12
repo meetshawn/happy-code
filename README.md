@@ -155,7 +155,7 @@ Inside TUI:
 Mode policy summary:
 
 - `plan`: read-only, produce implementation plan first
-- `edit`: allow file editing tools
+- `edit`: allow file editing + shell execution (with safety policy + approval flow)
 - `auto`: allow file editing + shell execution tools (no approval/safety gating)
 
 ## Session persistence
@@ -177,7 +177,7 @@ By default, session is stored at:
 - `patch_file`
 - `delete_file`
 - `search_in_files`
-- `run_shell` (only in `auto` mode)
+- `run_shell` (`edit` requires safety policy + approval, `auto` runs directly)
 - `git_status`
 - `git_diff`
 - `git_log`
@@ -189,7 +189,7 @@ By default, session is stored at:
 - Mode policy gates write/exec permissions
 - Tool calls are audited to `~/.happycode/audit.log` by default
 - Sensitive path writes can be blocked by `.happycode-policy.json`
-- Shell commands may require explicit approval prefix outside `auto`
+- Shell commands may require explicit approval (once / session / deny) outside `auto`
 
 Audit helpers:
 
@@ -207,14 +207,20 @@ happycode chat -m "status" --mode plan --no-audit
 
 ## Command approval flow
 
-When shell execution is requested outside `auto`, it may require explicit approval in TUI.
+When shell execution is requested outside `auto`, TUI will prompt 3 choices:
+
+- allow once (exact command, one-time)
+- allow in session (prefix in current session)
+- deny
 
 TUI commands:
 
 - `/allow once <command>`
 - `/allow session <prefix>`
+- `/allow global <prefix>`
 - `/approvals`
 - `/approvals clear`
+- `/approvals clear global`
 
 CLI helpers:
 
@@ -222,6 +228,8 @@ CLI helpers:
 happycode approvals --path
 happycode approvals --list
 happycode approvals --clear
+happycode approvals --list-global
+happycode approvals --clear-global
 ```
 
 ## Policy file
@@ -231,9 +239,15 @@ Initialize policy in project root:
 ```bash
 happycode policy --init
 happycode policy --path
+happycode policy --global-init
+happycode policy --global-path
 ```
 
 File: `.happycode-policy.json`
+
+Global file: `~/.happycode/policy.json`
+
+Precedence: project policy overrides global policy; global policy overrides built-in defaults.
 
 Supports:
 
