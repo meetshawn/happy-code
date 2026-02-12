@@ -780,7 +780,7 @@ function App({
   const themeStyle = THEME_STYLES[theme];
   const projectName = useMemo(() => path3.basename(process.cwd()), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
-  const flowSeparator = useMemo(() => "-".repeat(contentWidth), [contentWidth]);
+  const flowSeparator = useMemo(() => "\u2500".repeat(contentWidth), [contentWidth]);
   const shiftMode = useCallback(() => {
     setRuntime((prev) => {
       const currentIdx = MODE_CYCLE.indexOf(prev.mode);
@@ -1889,7 +1889,8 @@ Use /help`, setHistory, onHistoryChange);
         const finishedDetail = `Result: ${step.preview ?? "(no output)"}`;
         const baseDetail = effectiveStatus === "running" ? runningDetail : finishedDetail;
         return /* @__PURE__ */ jsxs(Box, { flexDirection: "column", width: contentWidth, children: [
-          /* @__PURE__ */ jsxs(Box, { borderStyle: "round", borderColor: statusColor, paddingX: 1, flexDirection: "column", children: [
+          /* @__PURE__ */ jsx(Text, { color: "gray", children: flowSeparator }),
+          /* @__PURE__ */ jsxs(Box, { paddingX: 1, flexDirection: "column", children: [
             /* @__PURE__ */ jsxs(Box, { children: [
               /* @__PURE__ */ jsx(Text, { color: statusColor, children: effectiveStatus === "running" ? "Running tool" : effectiveStatus === "done" ? "Tool completed" : effectiveStatus === "interrupted" ? "Tool interrupted" : "Tool failed" }),
               /* @__PURE__ */ jsxs(Text, { color: getToolTagColor(step.name), children: [
@@ -1920,7 +1921,6 @@ Use /help`, setHistory, onHistoryChange);
       error
     ] }) }) : null,
     /* @__PURE__ */ jsxs(Box, { marginTop: 1, flexDirection: "column", width: contentWidth, children: [
-      /* @__PURE__ */ jsx(Text, { color: "gray", children: flowSeparator }),
       /* @__PURE__ */ jsxs(Box, { children: [
         /* @__PURE__ */ jsx(Text, { color: "green", children: ">" }),
         /* @__PURE__ */ jsx(TextInput, { value: input, onChange: setInput, onSubmit: submit }, inputKey),
