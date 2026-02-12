@@ -71,7 +71,6 @@ In TUI:
 - `/tasks` and `/todos` for task extraction
 - `/copy` copy latest assistant answer
 - ask coding tasks in natural language
-- `/mode plan|edit|auto` switch runtime mode
 - `Shift+Tab` quick-switch mode (`plan -> edit -> auto`)
 - `/audit` show recent tool execution logs
 - `/memory` open memory file picker

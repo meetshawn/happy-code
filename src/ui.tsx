@@ -17,7 +17,7 @@ import {
 } from './memory.js';
 import { loadMcpConfig, getMcpConfigPath, initMcpConfig } from './mcp.js';
 import type { McpClientManager } from './mcp_client.js';
-import { SUPPORTED_MODES, type AgentMode } from './modes.js';
+import { type AgentMode } from './modes.js';
 import { getPolicyPath, writeDefaultPolicy } from './policy.js';
 import {
   listSessions,
@@ -90,7 +90,7 @@ type UserQuestionFocus = 'type' | 'option';
 
 type ModeIndicator = {
   mode: AgentMode;
-  source: 'hotkey' | 'command' | 'init';
+  source: 'hotkey' | 'init';
   updatedAt: number;
 };
 
@@ -147,7 +147,6 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/plan', complete: '/plan', desc: 'Generate implementation plan' },
   { cmd: '/test [command]', complete: '/test', desc: 'Run tests via tools' },
   { cmd: '/fix', complete: '/fix', desc: 'Investigate and fix issues' },
-  { cmd: '/mode plan|edit|auto', complete: '/mode ', desc: 'Switch mode' },
   { cmd: '/theme', complete: '/theme ', desc: 'Get or set UI theme' },
   { cmd: '/model [name]', complete: '/model ', desc: 'Get or set model' },
   { cmd: '/permissions', complete: '/permissions', desc: 'Show tool permission config' },
@@ -590,7 +589,6 @@ export function App({
     }
 
     const optionSuggestions = [
-      ...buildOptionSuggestions(input, '/mode ', ['plan', 'edit', 'auto'], 'Select mode'),
       ...buildOptionSuggestions(input, '/theme ', ['black-yellow', 'cyber', 'minimal'], 'Select theme'),
       ...buildOptionSuggestions(
         input,
@@ -1218,18 +1216,6 @@ export function App({
         return true;
       }
 
-      if (content.startsWith('/mode ')) {
-        const next = content.replace('/mode ', '').trim() as AgentMode;
-        if (SUPPORTED_MODES.includes(next)) {
-          setRuntime((prev) => ({ ...prev, mode: next }));
-          setModeIndicator({ mode: next, source: 'command', updatedAt: Date.now() });
-          setError(null);
-        } else {
-          setError(`Invalid mode: ${next}. Allowed: ${SUPPORTED_MODES.join(', ')}`);
-        }
-        return true;
-      }
-
       if (content === '/permissions') {
         const payload = {
           allowedTools: runtime.allowedTools,
@@ -1684,7 +1670,7 @@ export function App({
         <Text color="yellow">
           {modeIndicator.source === 'init'
             ? `Current mode: ${modeIndicator.mode}`
-            : `Mode switched (${modeIndicator.source === 'hotkey' ? 'Shift+Tab' : '/mode'}): ${modeIndicator.mode}`}
+            : `Mode switched (Shift+Tab): ${modeIndicator.mode}`}
         </Text>
       </Box>
 

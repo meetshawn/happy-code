@@ -766,7 +766,6 @@ var COMMANDS = [
   { cmd: "/plan", complete: "/plan", desc: "Generate implementation plan" },
   { cmd: "/test [command]", complete: "/test", desc: "Run tests via tools" },
   { cmd: "/fix", complete: "/fix", desc: "Investigate and fix issues" },
-  { cmd: "/mode plan|edit|auto", complete: "/mode ", desc: "Switch mode" },
   { cmd: "/theme", complete: "/theme ", desc: "Get or set UI theme" },
   { cmd: "/model [name]", complete: "/model ", desc: "Get or set model" },
   { cmd: "/permissions", complete: "/permissions", desc: "Show tool permission config" },
@@ -1161,7 +1160,6 @@ Path: ${result.path}`, setHistory, onHistoryChange);
       return [];
     }
     const optionSuggestions = [
-      ...buildOptionSuggestions(input, "/mode ", ["plan", "edit", "auto"], "Select mode"),
       ...buildOptionSuggestions(input, "/theme ", ["black-yellow", "cyber", "minimal"], "Select theme"),
       ...buildOptionSuggestions(
         input,
@@ -1714,17 +1712,6 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         }
         return true;
       }
-      if (content.startsWith("/mode ")) {
-        const next = content.replace("/mode ", "").trim();
-        if (SUPPORTED_MODES.includes(next)) {
-          setRuntime((prev) => ({ ...prev, mode: next }));
-          setModeIndicator({ mode: next, source: "command", updatedAt: Date.now() });
-          setError(null);
-        } else {
-          setError(`Invalid mode: ${next}. Allowed: ${SUPPORTED_MODES.join(", ")}`);
-        }
-        return true;
-      }
       if (content === "/permissions") {
         const payload = {
           allowedTools: runtime.allowedTools,
@@ -2118,7 +2105,7 @@ Use /help`, setHistory, onHistoryChange);
         /* @__PURE__ */ jsx(TextInput, { value: input, onChange: setInput, onSubmit: submit }, inputKey),
         inlineParamPlaceholder ? /* @__PURE__ */ jsx(Text, { color: "gray", children: inlineParamPlaceholder }) : null
       ] }),
-      /* @__PURE__ */ jsx(Text, { color: "yellow", children: modeIndicator.source === "init" ? `Current mode: ${modeIndicator.mode}` : `Mode switched (${modeIndicator.source === "hotkey" ? "Shift+Tab" : "/mode"}): ${modeIndicator.mode}` })
+      /* @__PURE__ */ jsx(Text, { color: "yellow", children: modeIndicator.source === "init" ? `Current mode: ${modeIndicator.mode}` : `Mode switched (Shift+Tab): ${modeIndicator.mode}` })
     ] }),
     inputSuggestions.length > 0 ? /* @__PURE__ */ jsxs(Box, { flexDirection: "column", children: [
       /* @__PURE__ */ jsx(Text, { color: "white", children: "Command Hints" }),
