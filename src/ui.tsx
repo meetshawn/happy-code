@@ -434,7 +434,7 @@ export function App({
   const themeStyle = THEME_STYLES[theme];
   const projectName = useMemo(() => path.basename(process.cwd()), []);
   const contentWidth = useMemo(() => Math.max(24, terminalColumns - 2), [terminalColumns]);
-  const flowSeparator = useMemo(() => '-'.repeat(contentWidth), [contentWidth]);
+  const flowSeparator = useMemo(() => '─'.repeat(contentWidth), [contentWidth]);
 
   const shiftMode = useCallback(() => {
     setRuntime((prev) => {
@@ -1690,9 +1690,10 @@ export function App({
           const finishedDetail = `Result: ${step.preview ?? '(no output)'}`;
           const baseDetail = effectiveStatus === 'running' ? runningDetail : finishedDetail;
 
-            return (
-              <Box key={row.key} flexDirection="column" width={contentWidth}>
-                <Box borderStyle="round" borderColor={statusColor} paddingX={1} flexDirection="column">
+          return (
+            <Box key={row.key} flexDirection="column" width={contentWidth}>
+              <Text color="gray">{flowSeparator}</Text>
+              <Box paddingX={1} flexDirection="column">
                 <Box>
                   <Text color={statusColor}>
                     {effectiveStatus === 'running' ? (
@@ -1708,9 +1709,7 @@ export function App({
                   <Text color={getToolTagColor(step.name)}> [{formatToolTag(step.name)}]</Text>
                   <Text color="gray"> {badge.icon} {badge.label}</Text>
                 </Box>
-                <Text color="gray">
-                  {toPreviewText(baseDetail, 10, 1200)}
-                </Text>
+                <Text color="gray">{toPreviewText(baseDetail, 10, 1200)}</Text>
               </Box>
               <Text color="gray">{flowSeparator}</Text>
             </Box>
@@ -1737,7 +1736,6 @@ export function App({
       ) : null}
 
       <Box marginTop={1} flexDirection="column" width={contentWidth}>
-        <Text color="gray">{flowSeparator}</Text>
         <Box>
           <Text color="green">{'>'}</Text>
           <TextInput key={inputKey} value={input} onChange={setInput} onSubmit={submit} />
