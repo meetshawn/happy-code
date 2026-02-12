@@ -311,7 +311,6 @@ export function App({
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState('');
   const [toolEvents, setToolEvents] = useState<ToolTimelineEvent[]>([]);
-  const [toolVerbose, setToolVerbose] = useState(true);
   const [theme, setTheme] = useState<ThemeName>('black-yellow');
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
@@ -421,11 +420,6 @@ export function App({
   }, [inputSuggestions]);
 
   useInput((inputKey, key) => {
-    if (inputKey.toLowerCase() === 'v') {
-      setToolVerbose((prev) => !prev);
-      return;
-    }
-
     if (key.escape) {
       setInputAtEnd('');
       setError(null);
@@ -587,7 +581,7 @@ export function App({
           `cwd: ${process.cwd()}`,
           `audit: ${enableAudit ? 'on' : 'off'}`,
           `history_messages: ${history.length}`,
-          `tool_verbose: ${toolVerbose ? 'on' : 'off'}`,
+          'tool_details: always',
           `theme: ${theme}`,
           `active_session: ${active.id} (${active.name})`
         ].join('\n');
@@ -1028,8 +1022,7 @@ export function App({
       history,
       onHistoryChange,
       runAgentTask,
-      runtime,
-      toolVerbose
+      runtime
     ]
   );
 
@@ -1266,7 +1259,7 @@ export function App({
                   <Text color="gray"> {badge.icon} {badge.label}</Text>
                 </Box>
                 <Text color="gray">
-                  {toPreviewText(baseDetail, toolVerbose ? 10 : 3, toolVerbose ? 1200 : 240)}
+                  {toPreviewText(baseDetail, 10, 1200)}
                 </Text>
               </Box>
               <Text color="gray">{flowSeparator}</Text>

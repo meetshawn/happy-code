@@ -714,7 +714,6 @@ function App({
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState("");
   const [toolEvents, setToolEvents] = useState([]);
-  const [toolVerbose, setToolVerbose] = useState(true);
   const [theme, setTheme] = useState("black-yellow");
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
@@ -809,10 +808,6 @@ function App({
     });
   }, [inputSuggestions]);
   useInput((inputKey2, key) => {
-    if (inputKey2.toLowerCase() === "v") {
-      setToolVerbose((prev) => !prev);
-      return;
-    }
     if (key.escape) {
       setInputAtEnd("");
       setError(null);
@@ -957,7 +952,7 @@ Referenced files content:${inline}`;
           `cwd: ${process.cwd()}`,
           `audit: ${enableAudit ? "on" : "off"}`,
           `history_messages: ${history.length}`,
-          `tool_verbose: ${toolVerbose ? "on" : "off"}`,
+          "tool_details: always",
           `theme: ${theme}`,
           `active_session: ${active.id} (${active.name})`
         ].join("\n");
@@ -1350,8 +1345,7 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
       history,
       onHistoryChange,
       runAgentTask,
-      runtime,
-      toolVerbose
+      runtime
     ]
   );
   const submit = useCallback(async () => {
@@ -1558,7 +1552,7 @@ Use /help`, setHistory, onHistoryChange);
                 badge.label
               ] })
             ] }),
-            /* @__PURE__ */ jsx(Text, { color: "gray", children: toPreviewText(baseDetail, toolVerbose ? 10 : 3, toolVerbose ? 1200 : 240) })
+            /* @__PURE__ */ jsx(Text, { color: "gray", children: toPreviewText(baseDetail, 10, 1200) })
           ] }),
           /* @__PURE__ */ jsx(Text, { color: "gray", children: flowSeparator })
         ] }, row.key);

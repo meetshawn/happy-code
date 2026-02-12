@@ -75,7 +75,6 @@ In TUI:
 - `/audit` show recent tool execution logs
 - `/clear` clears session history
 - `/exit` or `/quit` exits
-- press `v` to toggle tool-call details (compact/verbose)
 - type `/` to show command hints in TUI
 - use `↑/↓` to select hints, `Tab` to autocomplete command
 - when input is just `/`, press `Enter` to execute selected command (or insert if args needed)
