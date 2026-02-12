@@ -7,6 +7,7 @@ import { MultiAgentRuntime } from './agents_runtime.js';
 import { clearCommandApprovals, getApprovalPath, getApprovalPrefixes } from './approvals.js';
 import { getAuditPath, readRecentAudit } from './audit.js';
 import { getConfigPath, readConfig, writeConfig } from './config.js';
+import { buildRuntimeMemoryPrompt } from './memory.js';
 import { SUPPORTED_MODES, type AgentMode } from './modes.js';
 import { loadMcpConfig } from './mcp.js';
 import { McpClientManager } from './mcp_client.js';
@@ -184,7 +185,9 @@ program
         allowedTools,
         disallowedTools,
         systemPrompt: options.systemPrompt,
-        appendSystemPrompt: options.appendSystemPrompt,
+        appendSystemPrompt: [options.appendSystemPrompt ?? '', buildRuntimeMemoryPrompt(process.cwd())]
+          .filter(Boolean)
+          .join('\n\n') || undefined,
         mcpTools,
         mcpCall: (fullName, args) => mcpManager.callTool(fullName, args),
         enableAudit: options.audit !== false

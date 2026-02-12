@@ -74,6 +74,8 @@ In TUI:
 - `/mode plan|edit|auto` switch runtime mode
 - `Shift+Tab` quick-switch mode (`plan -> edit -> auto`)
 - `/audit` show recent tool execution logs
+- `/memory` open memory file picker
+- `/memory user|project` open memory file directly
 - `/clear` clears session history
 - `/exit` or `/quit` exits
 - type `/` to show command hints in TUI
@@ -120,6 +122,21 @@ happycode session --fork feature_x_fix
 happycode session --rewind 4
 happycode run --resume <sessionId>
 ```
+
+## Memory system
+
+HappyCode injects persistent memory into system prompt dynamically on each turn.
+
+- User memory (global): `~/.happycode/memory_user.md`
+- Project memory (per repo): `<project>/.happycode-memory.md`
+
+Edit memory by opening files via `/memory` and updating content manually.
+
+Injection policy:
+
+- always enabled in `run` and `chat`
+- soft constraints only
+- explicit user request in current turn has higher priority
 
 ## MCP runtime integration
 

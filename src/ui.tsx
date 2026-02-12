@@ -7,7 +7,14 @@ import type { HappyCodeAgent, ChatMessage, ToolEvent } from './agent.js';
 import { allowCommandPrefix, clearCommandApprovals, getApprovalPath, getApprovalPrefixes } from './approvals.js';
 import { readRecentAudit, getAuditPath } from './audit.js';
 import { getConfigPath, readConfig } from './config.js';
-import { clearMemory, getMemoryPath, readMemory } from './memory.js';
+import {
+  buildRuntimeMemoryPrompt,
+  getMemoryPath,
+  getProjectMemoryPath,
+  openMemoryFile,
+  type MemoryScope,
+  ensureMemoryFile
+} from './memory.js';
 import { loadMcpConfig, getMcpConfigPath, initMcpConfig } from './mcp.js';
 import type { McpClientManager } from './mcp_client.js';
 import { SUPPORTED_MODES, type AgentMode } from './modes.js';
@@ -81,6 +88,12 @@ type UserQuestionPayload = {
 
 type UserQuestionFocus = 'type' | 'option';
 
+type ModeIndicator = {
+  mode: AgentMode;
+  source: 'hotkey' | 'command' | 'init';
+  updatedAt: number;
+};
+
 type ThemeName = 'black-yellow' | 'cyber' | 'minimal';
 
 const THEME_STYLES: Record<
@@ -141,7 +154,7 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/permissions allow <tool>', complete: '/permissions allow ', desc: 'Allow specific tool' },
   { cmd: '/permissions deny <tool>', complete: '/permissions deny ', desc: 'Deny specific tool' },
   { cmd: '/permissions clear', complete: '/permissions clear', desc: 'Clear tool restrictions' },
-  { cmd: '/resume [sessionId]', complete: '/resume ', desc: 'Open session picker (↑/↓ + Enter)' },
+  { cmd: '/resume', complete: '/resume', desc: 'Open session picker (↑/↓ + Enter)' },
   { cmd: '/rewind <n>', complete: '/rewind ', desc: 'Drop last N messages' },
   { cmd: '/rename <name>', complete: '/rename ', desc: 'Rename current session' },
   { cmd: '/export [path]', complete: '/export ', desc: 'Export transcript' },
@@ -153,8 +166,8 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/copy', complete: '/copy', desc: 'Copy latest assistant response' },
   { cmd: '/debug', complete: '/debug', desc: 'Show debug info' },
   { cmd: '/doctor', complete: '/doctor', desc: 'Run environment checks' },
-  { cmd: '/memory', complete: '/memory', desc: 'Show memory notes' },
-  { cmd: '/memory clear', complete: '/memory clear', desc: 'Clear memory notes' },
+  { cmd: '/memory', complete: '/memory', desc: 'Open memory file picker' },
+  { cmd: '/memory user|project', complete: '/memory ', desc: 'Open selected memory file' },
   { cmd: '/mcp', complete: '/mcp', desc: 'Show MCP config status' },
   { cmd: '/mcp init', complete: '/mcp init', desc: 'Create MCP config' },
   { cmd: '/agents [prompt]', complete: '/agents ', desc: 'Run multi-agent orchestration' },
@@ -176,6 +189,41 @@ const MAX_RENDER_FLOW_ITEMS = 120;
 const MAX_TOOL_EVENTS_STORE = 2000;
 const MAX_PREVIEW_LINES = 5;
 const MAX_PREVIEW_CHARS = 560;
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+function formatAbsoluteTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return iso || 'unknown';
+  }
+  const year = date.getFullYear();
+  const month = pad2(date.getMonth() + 1);
+  const day = pad2(date.getDate());
+  const hours = pad2(date.getHours());
+  const minutes = pad2(date.getMinutes());
+  return `${year}-${month}-${day} ${hours}:${minutes}`;
+}
+
+function formatRelativeTime(iso: string, now = Date.now()): string {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) {
+    return 'unknown';
+  }
+  const diffSeconds = Math.floor((now - ts) / 1000);
+  if (diffSeconds <= 30) {
+    return 'just now';
+  }
+  if (diffSeconds < 3600) {
+    return `${Math.floor(diffSeconds / 60)}m ago`;
+  }
+  if (diffSeconds < 86400) {
+    return `${Math.floor(diffSeconds / 3600)}h ago`;
+  }
+  return `${Math.floor(diffSeconds / 86400)}d ago`;
+}
 
 function formatToolTag(name: string): string {
   const short = name.startsWith('mcp__') ? name.replace(/^mcp__/, '').replace(/__/g, '/') : name;
@@ -280,6 +328,15 @@ function countUserTurns(messages: ChatMessage[]): number {
   return messages.filter((item) => item.role === 'user').length;
 }
 
+function parseMemoryScope(raw: string): MemoryScope | null {
+  if (raw === 'user' || raw === 'project') {
+    return raw;
+  }
+  return null;
+}
+
+type MemoryPickerItem = { scope: MemoryScope; label: string };
+
 function pushAssistant(
   text: string,
   setHistory: React.Dispatch<React.SetStateAction<ChatMessage[]>>,
@@ -318,11 +375,12 @@ export function App({
 }: Props): React.JSX.Element {
   const { exit } = useApp();
   const { stdout } = useStdout();
+  const initialMode = defaultRuntime?.mode ?? defaultMode;
   const [terminalColumns, setTerminalColumns] = useState<number>(stdout.columns ?? 80);
   const [history, setHistory] = useState<ChatMessage[]>(initialHistory);
   const [input, setInput] = useState('');
   const [runtime, setRuntime] = useState<RuntimeOptions>({
-    mode: defaultRuntime?.mode ?? defaultMode,
+    mode: initialMode,
     model: defaultRuntime?.model ?? defaultModel,
     fallbackModel: defaultRuntime?.fallbackModel,
     maxTurns: defaultRuntime?.maxTurns ?? 8,
@@ -338,6 +396,11 @@ export function App({
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [modeIndicator, setModeIndicator] = useState<ModeIndicator>({
+    mode: initialMode,
+    source: 'init',
+    updatedAt: Date.now()
+  });
   const [resumePickerOpen, setResumePickerOpen] = useState(false);
   const [resumeCandidates, setResumeCandidates] = useState<SessionRecord[]>([]);
   const [resumeCursor, setResumeCursor] = useState(0);
@@ -345,6 +408,8 @@ export function App({
   const [questionFocus, setQuestionFocus] = useState<UserQuestionFocus>('option');
   const [selectedTypeIndex, setSelectedTypeIndex] = useState(0);
   const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
+  const [memoryPickerOpen, setMemoryPickerOpen] = useState(false);
+  const [memoryPickerCursor, setMemoryPickerCursor] = useState(0);
   const pendingQuestionResolveRef = useRef<((answer: Record<string, unknown>) => void) | null>(null);
   const toolSeqRef = useRef(0);
   const toolTurnRef = useRef(0);
@@ -361,10 +426,10 @@ export function App({
     setRuntime((prev) => {
       const currentIdx = MODE_CYCLE.indexOf(prev.mode);
       const nextMode = MODE_CYCLE[(currentIdx + 1 + MODE_CYCLE.length) % MODE_CYCLE.length] ?? MODE_CYCLE[0];
-      pushAssistant(`Switched mode to: ${nextMode}`, setHistory, onHistoryChange);
+      setModeIndicator({ mode: nextMode, source: 'hotkey', updatedAt: Date.now() });
       return { ...prev, mode: nextMode };
     });
-  }, [onHistoryChange]);
+  }, []);
 
   const closeUserQuestion = useCallback(() => {
     setPendingUserQuestion(null);
@@ -466,6 +531,42 @@ export function App({
     setResumeCursor(0);
   }, []);
 
+  const memoryPickerItems = useMemo<MemoryPickerItem[]>(
+    () => [
+      { scope: 'user', label: 'User Memory (Global)' },
+      { scope: 'project', label: 'Project Memory (Current Project)' }
+    ],
+    []
+  );
+
+  const closeMemoryPicker = useCallback(() => {
+    setMemoryPickerOpen(false);
+    setMemoryPickerCursor(0);
+  }, []);
+
+  const openMemoryByScope = useCallback(
+    async (scope: MemoryScope) => {
+      const result = await openMemoryFile(scope, process.cwd());
+      if (!result.ok) {
+        setError(result.message);
+        pushAssistant(`${result.message}\nPath: ${result.path}`, setHistory, onHistoryChange);
+        return;
+      }
+      setError(null);
+      pushAssistant(`${result.message}\nPath: ${result.path}`, setHistory, onHistoryChange);
+    },
+    [onHistoryChange]
+  );
+
+  const confirmMemorySelection = useCallback(() => {
+    const selected = memoryPickerItems[memoryPickerCursor];
+    if (!selected) {
+      return;
+    }
+    closeMemoryPicker();
+    void openMemoryByScope(selected.scope);
+  }, [closeMemoryPicker, memoryPickerCursor, memoryPickerItems, openMemoryByScope]);
+
   const confirmResumeSelection = useCallback(() => {
     const selected = resumeCandidates[resumeCursor];
     if (!selected) {
@@ -479,7 +580,7 @@ export function App({
     }
     applySwitchedSession(switched);
     closeResumePicker();
-    pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
+    pushAssistant(`Resumed session: ${switched.name}`, setHistory, onHistoryChange);
   }, [applySwitchedSession, closeResumePicker, onHistoryChange, resumeCandidates, resumeCursor]);
 
   const inputSuggestions = useMemo(() => {
@@ -596,6 +697,29 @@ export function App({
       }
     }
 
+    if (memoryPickerOpen) {
+      if (key.escape) {
+        closeMemoryPicker();
+        setError(null);
+        return;
+      }
+      if (memoryPickerItems.length === 0) {
+        return;
+      }
+      if (key.upArrow) {
+        setMemoryPickerCursor((prev) => (prev - 1 + memoryPickerItems.length) % memoryPickerItems.length);
+        return;
+      }
+      if (key.downArrow) {
+        setMemoryPickerCursor((prev) => (prev + 1) % memoryPickerItems.length);
+        return;
+      }
+      if (key.return) {
+        confirmMemorySelection();
+        return;
+      }
+    }
+
     if (key.escape) {
       setInputAtEnd('');
       setError(null);
@@ -682,6 +806,8 @@ export function App({
 
       try {
         const mcpTools = mcpManager ? await mcpManager.listTools() : [];
+        const memoryPrompt = buildRuntimeMemoryPrompt(process.cwd());
+        const mergedAppendPrompt = [runtime.appendSystemPrompt ?? '', memoryPrompt].filter(Boolean).join('\n\n');
         const reply = await agent.chatStream(
           nextHistory,
           {
@@ -694,7 +820,7 @@ export function App({
             allowedTools: runtime.allowedTools,
             disallowedTools: runtime.disallowedTools,
             systemPrompt: runtime.systemPrompt,
-            appendSystemPrompt: runtime.appendSystemPrompt,
+            appendSystemPrompt: mergedAppendPrompt || undefined,
             mcpTools,
             mcpCall: mcpManager
               ? (fullName, args) => mcpManager.callTool(fullName, args)
@@ -878,7 +1004,8 @@ export function App({
           `config_exists: ${fs.existsSync(getConfigPath())}`,
           `policy_exists: ${fs.existsSync(getPolicyPath(process.cwd()))}`,
           `mcp_exists: ${fs.existsSync(getMcpConfigPath(process.cwd()))}`,
-          `memory_exists: ${fs.existsSync(getMemoryPath())}`,
+          `memory_user_exists: ${fs.existsSync(getMemoryPath())}`,
+          `memory_project_exists: ${fs.existsSync(getProjectMemoryPath(process.cwd()))}`,
           `audit_exists: ${fs.existsSync(getAuditPath())}`
         ].join('\n');
         pushAssistant(checks, setHistory, onHistoryChange);
@@ -973,7 +1100,8 @@ export function App({
           `config: ${getConfigPath()}`,
           `policy: ${getPolicyPath(process.cwd())}`,
           `mcp: ${getMcpConfigPath(process.cwd())}`,
-          `memory: ${getMemoryPath()}`,
+          `memory_user: ${getMemoryPath()}`,
+          `memory_project: ${getProjectMemoryPath(process.cwd())}`,
           `audit: ${getAuditPath()}`,
           `approvals: ${getApprovalPath()}`
         ].join('\n');
@@ -999,14 +1127,22 @@ export function App({
       }
 
       if (content === '/memory') {
-        const memory = readMemory();
-        pushAssistant(memory || `No memory notes. Path: ${getMemoryPath()}`, setHistory, onHistoryChange);
+        setMemoryPickerOpen(true);
+        setMemoryPickerCursor(0);
+        setError(null);
+        setInput('');
         return true;
       }
 
-      if (content === '/memory clear') {
-        clearMemory();
-        pushAssistant('Memory cleared.', setHistory, onHistoryChange);
+      if (content.startsWith('/memory ')) {
+        const args = content.replace('/memory ', '').trim().split(/\s+/).filter(Boolean);
+        const scope = parseMemoryScope((args[0] ?? '').toLowerCase());
+        if (!scope) {
+          pushAssistant('Usage:\n/memory\n/memory user\n/memory project', setHistory, onHistoryChange);
+          return true;
+        }
+        ensureMemoryFile(scope, process.cwd());
+        void openMemoryByScope(scope);
         return true;
       }
 
@@ -1086,8 +1222,8 @@ export function App({
         const next = content.replace('/mode ', '').trim() as AgentMode;
         if (SUPPORTED_MODES.includes(next)) {
           setRuntime((prev) => ({ ...prev, mode: next }));
+          setModeIndicator({ mode: next, source: 'command', updatedAt: Date.now() });
           setError(null);
-          pushAssistant(`Switched mode to: ${next}`, setHistory, onHistoryChange);
         } else {
           setError(`Invalid mode: ${next}. Allowed: ${SUPPORTED_MODES.join(', ')}`);
         }
@@ -1150,15 +1286,7 @@ export function App({
       }
 
       if (content.startsWith('/resume ')) {
-        const id = content.replace('/resume ', '').trim();
-        const switched = switchSession(id, process.cwd());
-        if (!switched) {
-          pushAssistant(`Session not found: ${id}`, setHistory, onHistoryChange);
-          return true;
-        }
-        applySwitchedSession(switched);
-        closeResumePicker();
-        pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
+        pushAssistant('Usage: /resume (no id needed). Pick one from the list.', setHistory, onHistoryChange);
         return true;
       }
 
@@ -1246,6 +1374,7 @@ export function App({
       history,
       onHistoryChange,
       runAgentTask,
+      openMemoryByScope,
       runtime
     ]
   );
@@ -1258,6 +1387,11 @@ export function App({
 
     if (resumePickerOpen) {
       confirmResumeSelection();
+      return;
+    }
+
+    if (memoryPickerOpen) {
+      confirmMemorySelection();
       return;
     }
 
@@ -1320,10 +1454,12 @@ export function App({
     onHistoryChange,
     runAgentTask,
     confirmResumeSelection,
+    confirmMemorySelection,
     confirmUserQuestion,
     setInputAtEnd,
     suggestionIndex,
     resumePickerOpen,
+    memoryPickerOpen,
     pendingUserQuestion
   ]);
 
@@ -1545,6 +1681,11 @@ export function App({
           <TextInput key={inputKey} value={input} onChange={setInput} onSubmit={submit} />
           {inlineParamPlaceholder ? <Text color="gray">{inlineParamPlaceholder}</Text> : null}
         </Box>
+        <Text color="yellow">
+          {modeIndicator.source === 'init'
+            ? `Current mode: ${modeIndicator.mode}`
+            : `Mode switched (${modeIndicator.source === 'hotkey' ? 'Shift+Tab' : '/mode'}): ${modeIndicator.mode}`}
+        </Text>
       </Box>
 
       {inputSuggestions.length > 0 ? (
@@ -1581,9 +1722,25 @@ export function App({
           <Text color="white">Resume Sessions (↑/↓ choose, Enter confirm, Esc cancel)</Text>
           {visibleResumeCandidates.map((item) => {
             const selected = resumeCandidates[resumeCursor]?.id === item.id;
+            const absoluteEditedAt = formatAbsoluteTime(item.updatedAt);
+            const relativeEditedAt = formatRelativeTime(item.updatedAt);
             return (
               <Text key={item.id} color={selected ? 'cyan' : 'white'}>
-                {selected ? '>' : ' '} {item.name} [{item.id}] {item.updatedAt} msgs:{item.messages.length}
+                {selected ? '>' : ' '} {item.name} last:{absoluteEditedAt} ({relativeEditedAt}) msgs:{item.messages.length}
+              </Text>
+            );
+          })}
+        </Box>
+      ) : null}
+
+      {memoryPickerOpen ? (
+        <Box marginTop={1} flexDirection="column" width={contentWidth}>
+          <Text color="white">Memory Files (↑/↓ choose, Enter open, Esc cancel)</Text>
+          {memoryPickerItems.map((item, idx) => {
+            const selected = idx === memoryPickerCursor;
+            return (
+              <Text key={item.scope} color={selected ? 'cyan' : 'white'}>
+                {selected ? '>' : ' '} {item.label}
               </Text>
             );
           })}

@@ -51,20 +51,264 @@ ${item.output}`).join("\n\n");
   }
 };
 
-// src/mcp.ts
+// src/memory.ts
 import fs from "fs";
+import os from "os";
 import path from "path";
+import { exec } from "child_process";
+var GLOBAL_MEMORY_PATH = path.join(os.homedir(), ".happycode", "memory_user.md");
+var LEGACY_MEMORY_PATH = path.join(os.homedir(), ".happycode", "memory.md");
+var PROJECT_MEMORY_FILE = ".happycode-memory.md";
+var MEMORY_PROMPT_MAX_CHARS = 2400;
+var SECTION_LABELS = {
+  facts: "Facts",
+  preferences: "Preferences",
+  constraints: "Constraints",
+  notes: "Notes"
+};
+var SECTION_PRIORITY = ["constraints", "preferences", "facts", "notes"];
+function normalizeLine(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function emptyDocument(scope) {
+  return {
+    scope,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    facts: [],
+    preferences: [],
+    constraints: [],
+    notes: []
+  };
+}
+function parseSectionLabel(raw) {
+  const normalized = normalizeLine(raw).toLowerCase();
+  if (normalized === "facts") {
+    return "facts";
+  }
+  if (normalized === "preferences") {
+    return "preferences";
+  }
+  if (normalized === "constraints") {
+    return "constraints";
+  }
+  if (normalized === "notes") {
+    return "notes";
+  }
+  return null;
+}
+function parseMemoryMarkdown(content, scope) {
+  const doc = emptyDocument(scope);
+  let activeSection = null;
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed.startsWith("# ")) {
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      activeSection = parseSectionLabel(trimmed.slice(3));
+      continue;
+    }
+    if (trimmed.startsWith("- updatedAt:")) {
+      const raw = normalizeLine(trimmed.slice("- updatedAt:".length));
+      if (raw) {
+        doc.updatedAt = raw;
+      }
+      continue;
+    }
+    if (!activeSection) {
+      continue;
+    }
+    const value = trimmed.startsWith("- ") ? normalizeLine(trimmed.slice(2)) : normalizeLine(trimmed);
+    if (!value) {
+      continue;
+    }
+    doc[activeSection].push(value);
+  }
+  return doc;
+}
+function toMemoryMarkdown(doc) {
+  const lines = [
+    "# HappyCode Memory",
+    "## Meta",
+    `- scope: ${doc.scope}`,
+    `- updatedAt: ${doc.updatedAt}`
+  ];
+  for (const section of SECTION_PRIORITY) {
+    lines.push(`## ${SECTION_LABELS[section]}`);
+    const entries = doc[section];
+    if (entries.length === 0) {
+      lines.push("- (empty)");
+      continue;
+    }
+    for (const item of entries) {
+      lines.push(`- ${item}`);
+    }
+  }
+  return `${lines.join("\n")}
+`;
+}
+function defaultMemoryMarkdown(scope) {
+  return toMemoryMarkdown(emptyDocument(scope));
+}
+function ensureParentDir(filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+function scopePath(scope, cwd = process.cwd()) {
+  if (scope === "user") {
+    return GLOBAL_MEMORY_PATH;
+  }
+  return path.join(cwd, PROJECT_MEMORY_FILE);
+}
+function enforceUniqueSection(items) {
+  const seen = /* @__PURE__ */ new Set();
+  const deduped = [];
+  for (const item of items) {
+    const normalized = normalizeLine(item);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    deduped.push(normalized);
+  }
+  return deduped;
+}
+function truncateBlock(lines, limit) {
+  const buffer = [];
+  for (const line of lines) {
+    const next = buffer.length === 0 ? line : `${buffer.join("\n")}
+${line}`;
+    if (next.length > limit) {
+      if (buffer.length === 0) {
+        return `${line.slice(0, Math.max(0, limit - 3))}...`;
+      }
+      return `${buffer.join("\n")}
+...`;
+    }
+    buffer.push(line);
+  }
+  return buffer.join("\n");
+}
+function buildScopePrompt(title, doc, limit) {
+  const lines = [title];
+  for (const section of SECTION_PRIORITY) {
+    const entries = doc[section];
+    if (entries.length === 0) {
+      continue;
+    }
+    lines.push(`${SECTION_LABELS[section]}:`);
+    for (const entry of entries) {
+      lines.push(`- ${entry}`);
+    }
+  }
+  if (lines.length === 1) {
+    lines.push("- (empty)");
+  }
+  return truncateBlock(lines, limit);
+}
+function getMemoryPath() {
+  return GLOBAL_MEMORY_PATH;
+}
+function getProjectMemoryPath(cwd = process.cwd()) {
+  return scopePath("project", cwd);
+}
+function readMemoryDocument(scope = "user", cwd = process.cwd()) {
+  const target = scopePath(scope, cwd);
+  if (!fs.existsSync(target)) {
+    if (scope === "user" && fs.existsSync(LEGACY_MEMORY_PATH)) {
+      const legacy = fs.readFileSync(LEGACY_MEMORY_PATH, "utf8");
+      const migrated = parseMemoryMarkdown(legacy, scope);
+      writeMemoryDocument(scope, migrated, cwd);
+      return migrated;
+    }
+    return emptyDocument(scope);
+  }
+  const raw = fs.readFileSync(target, "utf8");
+  return parseMemoryMarkdown(raw, scope);
+}
+function writeMemoryDocument(scope, doc, cwd = process.cwd()) {
+  const target = scopePath(scope, cwd);
+  ensureParentDir(target);
+  const normalized = {
+    ...doc,
+    scope,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    facts: enforceUniqueSection(doc.facts),
+    preferences: enforceUniqueSection(doc.preferences),
+    constraints: enforceUniqueSection(doc.constraints),
+    notes: enforceUniqueSection(doc.notes)
+  };
+  fs.writeFileSync(target, toMemoryMarkdown(normalized), "utf8");
+}
+function ensureMemoryFile(scope, cwd = process.cwd()) {
+  const target = scopePath(scope, cwd);
+  if (!fs.existsSync(target)) {
+    ensureParentDir(target);
+    fs.writeFileSync(target, defaultMemoryMarkdown(scope), "utf8");
+  }
+  return target;
+}
+async function openMemoryFile(scope, cwd = process.cwd()) {
+  const target = ensureMemoryFile(scope, cwd);
+  const escaped = target.replace(/"/g, '\\"');
+  const command = process.platform === "win32" ? `start "" "${escaped}"` : process.platform === "darwin" ? `open "${escaped}"` : `xdg-open "${escaped}"`;
+  return new Promise((resolve) => {
+    exec(command, (error) => {
+      if (error) {
+        resolve({
+          ok: false,
+          path: target,
+          message: `Failed to open memory file automatically: ${error.message}`
+        });
+        return;
+      }
+      resolve({
+        ok: true,
+        path: target,
+        message: `Opened ${scope} memory file.`
+      });
+    });
+  });
+}
+function buildRuntimeMemoryPrompt(cwd = process.cwd(), maxChars = MEMORY_PROMPT_MAX_CHARS) {
+  const userDoc = readMemoryDocument("user", cwd);
+  const projectDoc = readMemoryDocument("project", cwd);
+  const perScope = Math.max(200, Math.floor(maxChars / 2));
+  const userBlock = buildScopePrompt("User Memory:", userDoc, perScope);
+  const projectBlock = buildScopePrompt("Project Memory:", projectDoc, perScope);
+  const merged = [
+    "[Persistent Memory]",
+    userBlock,
+    "",
+    projectBlock,
+    "",
+    "Use memory as soft constraints. If explicit user request conflicts in this turn, follow current request."
+  ].join("\n").trim();
+  if (merged === "[Persistent Memory]") {
+    return "";
+  }
+  if (merged.length <= maxChars) {
+    return merged;
+  }
+  return `${merged.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+// src/mcp.ts
+import fs2 from "fs";
+import path2 from "path";
 var MCP_CONFIG_NAME = ".happycode-mcp.json";
 function getMcpConfigPath(cwd) {
-  return path.join(cwd, MCP_CONFIG_NAME);
+  return path2.join(cwd, MCP_CONFIG_NAME);
 }
 function loadMcpConfig(cwd) {
   const p = getMcpConfigPath(cwd);
-  if (!fs.existsSync(p)) {
+  if (!fs2.existsSync(p)) {
     return { servers: [] };
   }
   try {
-    const raw = fs.readFileSync(p, "utf8");
+    const raw = fs2.readFileSync(p, "utf8");
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed.servers)) {
       return { servers: [] };
@@ -76,7 +320,7 @@ function loadMcpConfig(cwd) {
 }
 function saveMcpConfig(cwd, config) {
   const p = getMcpConfigPath(cwd);
-  fs.writeFileSync(p, `${JSON.stringify(config, null, 2)}
+  fs2.writeFileSync(p, `${JSON.stringify(config, null, 2)}
 `, "utf8");
   return p;
 }
@@ -230,23 +474,23 @@ var McpClientManager = class {
 };
 
 // src/session.ts
-import fs2 from "fs";
-import os from "os";
-import path2 from "path";
+import fs3 from "fs";
+import os2 from "os";
+import path3 from "path";
 import { createHash } from "crypto";
-var SESSION_ROOT = path2.join(os.homedir(), ".happycode", "sessions");
-var ACTIVE_FILE = path2.join(SESSION_ROOT, "active-session.txt");
-var ACTIVE_MAP_FILE = path2.join(SESSION_ROOT, "active-sessions.json");
+var SESSION_ROOT = path3.join(os2.homedir(), ".happycode", "sessions");
+var ACTIVE_FILE = path3.join(SESSION_ROOT, "active-session.txt");
+var ACTIVE_MAP_FILE = path3.join(SESSION_ROOT, "active-sessions.json");
 function ensureDir() {
-  fs2.mkdirSync(SESSION_ROOT, { recursive: true });
+  fs3.mkdirSync(SESSION_ROOT, { recursive: true });
 }
 function safeName(input) {
   return input.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60) || "session";
 }
 function resolveProjectRoot(cwd) {
-  const target = path2.resolve(cwd);
+  const target = path3.resolve(cwd);
   try {
-    return fs2.realpathSync(target);
+    return fs3.realpathSync(target);
   } catch {
     return target;
   }
@@ -270,11 +514,11 @@ function normalizeRecord(record) {
 }
 function readActiveMap() {
   ensureDir();
-  if (!fs2.existsSync(ACTIVE_MAP_FILE)) {
+  if (!fs3.existsSync(ACTIVE_MAP_FILE)) {
     return {};
   }
   try {
-    const raw = fs2.readFileSync(ACTIVE_MAP_FILE, "utf8");
+    const raw = fs3.readFileSync(ACTIVE_MAP_FILE, "utf8");
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
@@ -283,14 +527,14 @@ function readActiveMap() {
 }
 function writeActiveMap(map) {
   ensureDir();
-  fs2.writeFileSync(ACTIVE_MAP_FILE, `${JSON.stringify(map, null, 2)}
+  fs3.writeFileSync(ACTIVE_MAP_FILE, `${JSON.stringify(map, null, 2)}
 `, "utf8");
 }
 function isProjectMatch(record, projectKey) {
   return !record.projectKey || record.projectKey === projectKey;
 }
 function sessionPathById(id) {
-  return path2.join(SESSION_ROOT, `${id}.json`);
+  return path3.join(SESSION_ROOT, `${id}.json`);
 }
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
@@ -303,7 +547,7 @@ function getSessionRootPath() {
   return SESSION_ROOT;
 }
 function getLegacySessionPath() {
-  return path2.join(os.homedir(), ".happycode", "session.json");
+  return path3.join(os2.homedir(), ".happycode", "session.json");
 }
 function createSession(name = "default", cwd = process.cwd()) {
   ensureDir();
@@ -331,16 +575,16 @@ function saveSessionRecord(record) {
     toolEvents: Array.isArray(record.toolEvents) ? record.toolEvents : [],
     updatedAt: nowIso()
   };
-  fs2.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}
+  fs3.writeFileSync(sessionPathById(next.id), `${JSON.stringify(next, null, 2)}
 `, "utf8");
 }
 function loadSessionById(id) {
   const p = sessionPathById(id);
-  if (!fs2.existsSync(p)) {
+  if (!fs3.existsSync(p)) {
     return null;
   }
   try {
-    const raw = fs2.readFileSync(p, "utf8");
+    const raw = fs3.readFileSync(p, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed || !Array.isArray(parsed.messages)) {
       return null;
@@ -353,11 +597,11 @@ function loadSessionById(id) {
 function listSessions(cwd = process.cwd()) {
   ensureDir();
   const { projectKey } = projectMetaFromCwd(cwd);
-  const files = fs2.readdirSync(SESSION_ROOT).filter((item) => item.endsWith(".json")).map((item) => path2.join(SESSION_ROOT, item));
+  const files = fs3.readdirSync(SESSION_ROOT).filter((item) => item.endsWith(".json")).map((item) => path3.join(SESSION_ROOT, item));
   const sessions = [];
   for (const file of files) {
     try {
-      const raw = fs2.readFileSync(file, "utf8");
+      const raw = fs3.readFileSync(file, "utf8");
       const parsed = JSON.parse(raw);
       if (parsed && Array.isArray(parsed.messages)) {
         const normalized = normalizeRecord(parsed);
@@ -378,7 +622,7 @@ function setActiveSessionId(id, cwd = process.cwd()) {
   const map = readActiveMap();
   map[projectKey] = id;
   writeActiveMap(map);
-  fs2.writeFileSync(ACTIVE_FILE, `${id}
+  fs3.writeFileSync(ACTIVE_FILE, `${id}
 `, "utf8");
 }
 function getActiveSessionId(cwd = process.cwd()) {
@@ -388,9 +632,9 @@ function getActiveSessionId(cwd = process.cwd()) {
   if (scoped) {
     return scoped;
   }
-  if (fs2.existsSync(ACTIVE_FILE)) {
+  if (fs3.existsSync(ACTIVE_FILE)) {
     try {
-      const legacyId = fs2.readFileSync(ACTIVE_FILE, "utf8").trim();
+      const legacyId = fs3.readFileSync(ACTIVE_FILE, "utf8").trim();
       if (legacyId) {
         const record = loadSessionById(legacyId);
         if (record && isProjectMatch(record, projectKey)) {
@@ -488,28 +732,6 @@ import path4 from "path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
-
-// src/memory.ts
-import fs3 from "fs";
-import os2 from "os";
-import path3 from "path";
-var MEMORY_PATH = path3.join(os2.homedir(), ".happycode", "memory.md");
-function getMemoryPath() {
-  return MEMORY_PATH;
-}
-function readMemory() {
-  if (!fs3.existsSync(MEMORY_PATH)) {
-    return "";
-  }
-  return fs3.readFileSync(MEMORY_PATH, "utf8");
-}
-function clearMemory() {
-  if (fs3.existsSync(MEMORY_PATH)) {
-    fs3.unlinkSync(MEMORY_PATH);
-  }
-}
-
-// src/ui.tsx
 import { jsx, jsxs } from "react/jsx-runtime";
 var THEME_STYLES = {
   "black-yellow": {
@@ -551,7 +773,7 @@ var COMMANDS = [
   { cmd: "/permissions allow <tool>", complete: "/permissions allow ", desc: "Allow specific tool" },
   { cmd: "/permissions deny <tool>", complete: "/permissions deny ", desc: "Deny specific tool" },
   { cmd: "/permissions clear", complete: "/permissions clear", desc: "Clear tool restrictions" },
-  { cmd: "/resume [sessionId]", complete: "/resume ", desc: "Open session picker (\u2191/\u2193 + Enter)" },
+  { cmd: "/resume", complete: "/resume", desc: "Open session picker (\u2191/\u2193 + Enter)" },
   { cmd: "/rewind <n>", complete: "/rewind ", desc: "Drop last N messages" },
   { cmd: "/rename <name>", complete: "/rename ", desc: "Rename current session" },
   { cmd: "/export [path]", complete: "/export ", desc: "Export transcript" },
@@ -563,8 +785,8 @@ var COMMANDS = [
   { cmd: "/copy", complete: "/copy", desc: "Copy latest assistant response" },
   { cmd: "/debug", complete: "/debug", desc: "Show debug info" },
   { cmd: "/doctor", complete: "/doctor", desc: "Run environment checks" },
-  { cmd: "/memory", complete: "/memory", desc: "Show memory notes" },
-  { cmd: "/memory clear", complete: "/memory clear", desc: "Clear memory notes" },
+  { cmd: "/memory", complete: "/memory", desc: "Open memory file picker" },
+  { cmd: "/memory user|project", complete: "/memory ", desc: "Open selected memory file" },
   { cmd: "/mcp", complete: "/mcp", desc: "Show MCP config status" },
   { cmd: "/mcp init", complete: "/mcp init", desc: "Create MCP config" },
   { cmd: "/agents [prompt]", complete: "/agents ", desc: "Run multi-agent orchestration" },
@@ -585,6 +807,38 @@ var MAX_RENDER_FLOW_ITEMS = 120;
 var MAX_TOOL_EVENTS_STORE = 2e3;
 var MAX_PREVIEW_LINES = 5;
 var MAX_PREVIEW_CHARS = 560;
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+function formatAbsoluteTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return iso || "unknown";
+  }
+  const year = date.getFullYear();
+  const month = pad2(date.getMonth() + 1);
+  const day = pad2(date.getDate());
+  const hours = pad2(date.getHours());
+  const minutes = pad2(date.getMinutes());
+  return `${year}-${month}-${day} ${hours}:${minutes}`;
+}
+function formatRelativeTime(iso, now = Date.now()) {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) {
+    return "unknown";
+  }
+  const diffSeconds = Math.floor((now - ts) / 1e3);
+  if (diffSeconds <= 30) {
+    return "just now";
+  }
+  if (diffSeconds < 3600) {
+    return `${Math.floor(diffSeconds / 60)}m ago`;
+  }
+  if (diffSeconds < 86400) {
+    return `${Math.floor(diffSeconds / 3600)}h ago`;
+  }
+  return `${Math.floor(diffSeconds / 86400)}d ago`;
+}
 function formatToolTag(name) {
   const short = name.startsWith("mcp__") ? name.replace(/^mcp__/, "").replace(/__/g, "/") : name;
   return short.length > 28 ? `${short.slice(0, 27)}...` : short;
@@ -673,6 +927,12 @@ function getInlineParamPlaceholder(input) {
 function countUserTurns(messages) {
   return messages.filter((item) => item.role === "user").length;
 }
+function parseMemoryScope(raw) {
+  if (raw === "user" || raw === "project") {
+    return raw;
+  }
+  return null;
+}
 function pushAssistant(text, setHistory, onHistoryChange) {
   setHistory((prev) => {
     const assistantMessage = { role: "assistant", content: text };
@@ -705,11 +965,12 @@ function App({
 }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
+  const initialMode = defaultRuntime?.mode ?? defaultMode;
   const [terminalColumns, setTerminalColumns] = useState(stdout.columns ?? 80);
   const [history, setHistory] = useState(initialHistory);
   const [input, setInput] = useState("");
   const [runtime, setRuntime] = useState({
-    mode: defaultRuntime?.mode ?? defaultMode,
+    mode: initialMode,
     model: defaultRuntime?.model ?? defaultModel,
     fallbackModel: defaultRuntime?.fallbackModel,
     maxTurns: defaultRuntime?.maxTurns ?? 8,
@@ -725,6 +986,11 @@ function App({
   const [suggestionIndex, setSuggestionIndex] = useState(0);
   const [inputKey, setInputKey] = useState(0);
   const [error, setError] = useState(null);
+  const [modeIndicator, setModeIndicator] = useState({
+    mode: initialMode,
+    source: "init",
+    updatedAt: Date.now()
+  });
   const [resumePickerOpen, setResumePickerOpen] = useState(false);
   const [resumeCandidates, setResumeCandidates] = useState([]);
   const [resumeCursor, setResumeCursor] = useState(0);
@@ -732,6 +998,8 @@ function App({
   const [questionFocus, setQuestionFocus] = useState("option");
   const [selectedTypeIndex, setSelectedTypeIndex] = useState(0);
   const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
+  const [memoryPickerOpen, setMemoryPickerOpen] = useState(false);
+  const [memoryPickerCursor, setMemoryPickerCursor] = useState(0);
   const pendingQuestionResolveRef = useRef(null);
   const toolSeqRef = useRef(0);
   const toolTurnRef = useRef(0);
@@ -746,10 +1014,10 @@ function App({
     setRuntime((prev) => {
       const currentIdx = MODE_CYCLE.indexOf(prev.mode);
       const nextMode = MODE_CYCLE[(currentIdx + 1 + MODE_CYCLE.length) % MODE_CYCLE.length] ?? MODE_CYCLE[0];
-      pushAssistant(`Switched mode to: ${nextMode}`, setHistory, onHistoryChange);
+      setModeIndicator({ mode: nextMode, source: "hotkey", updatedAt: Date.now() });
       return { ...prev, mode: nextMode };
     });
-  }, [onHistoryChange]);
+  }, []);
   const closeUserQuestion = useCallback(() => {
     setPendingUserQuestion(null);
     setQuestionFocus("option");
@@ -838,6 +1106,40 @@ function App({
     setResumeCandidates([]);
     setResumeCursor(0);
   }, []);
+  const memoryPickerItems = useMemo(
+    () => [
+      { scope: "user", label: "User Memory (Global)" },
+      { scope: "project", label: "Project Memory (Current Project)" }
+    ],
+    []
+  );
+  const closeMemoryPicker = useCallback(() => {
+    setMemoryPickerOpen(false);
+    setMemoryPickerCursor(0);
+  }, []);
+  const openMemoryByScope = useCallback(
+    async (scope) => {
+      const result = await openMemoryFile(scope, process.cwd());
+      if (!result.ok) {
+        setError(result.message);
+        pushAssistant(`${result.message}
+Path: ${result.path}`, setHistory, onHistoryChange);
+        return;
+      }
+      setError(null);
+      pushAssistant(`${result.message}
+Path: ${result.path}`, setHistory, onHistoryChange);
+    },
+    [onHistoryChange]
+  );
+  const confirmMemorySelection = useCallback(() => {
+    const selected = memoryPickerItems[memoryPickerCursor];
+    if (!selected) {
+      return;
+    }
+    closeMemoryPicker();
+    void openMemoryByScope(selected.scope);
+  }, [closeMemoryPicker, memoryPickerCursor, memoryPickerItems, openMemoryByScope]);
   const confirmResumeSelection = useCallback(() => {
     const selected = resumeCandidates[resumeCursor];
     if (!selected) {
@@ -851,7 +1153,7 @@ function App({
     }
     applySwitchedSession(switched);
     closeResumePicker();
-    pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
+    pushAssistant(`Resumed session: ${switched.name}`, setHistory, onHistoryChange);
   }, [applySwitchedSession, closeResumePicker, onHistoryChange, resumeCandidates, resumeCursor]);
   const inputSuggestions = useMemo(() => {
     const trimmed = input.trim();
@@ -949,6 +1251,28 @@ function App({
         return;
       }
     }
+    if (memoryPickerOpen) {
+      if (key.escape) {
+        closeMemoryPicker();
+        setError(null);
+        return;
+      }
+      if (memoryPickerItems.length === 0) {
+        return;
+      }
+      if (key.upArrow) {
+        setMemoryPickerCursor((prev) => (prev - 1 + memoryPickerItems.length) % memoryPickerItems.length);
+        return;
+      }
+      if (key.downArrow) {
+        setMemoryPickerCursor((prev) => (prev + 1) % memoryPickerItems.length);
+        return;
+      }
+      if (key.return) {
+        confirmMemorySelection();
+        return;
+      }
+    }
     if (key.escape) {
       setInputAtEnd("");
       setError(null);
@@ -1022,6 +1346,8 @@ Referenced files content:${inline}`;
       });
       try {
         const mcpTools = mcpManager ? await mcpManager.listTools() : [];
+        const memoryPrompt = buildRuntimeMemoryPrompt(process.cwd());
+        const mergedAppendPrompt = [runtime.appendSystemPrompt ?? "", memoryPrompt].filter(Boolean).join("\n\n");
         const reply = await agent.chatStream(
           nextHistory,
           {
@@ -1034,7 +1360,7 @@ Referenced files content:${inline}`;
             allowedTools: runtime.allowedTools,
             disallowedTools: runtime.disallowedTools,
             systemPrompt: runtime.systemPrompt,
-            appendSystemPrompt: runtime.appendSystemPrompt,
+            appendSystemPrompt: mergedAppendPrompt || void 0,
             mcpTools,
             mcpCall: mcpManager ? (fullName, args) => mcpManager.callTool(fullName, args) : void 0,
             onUserQuestion: (payload) => new Promise((resolve) => {
@@ -1199,7 +1525,8 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
           `config_exists: ${fs4.existsSync(getConfigPath())}`,
           `policy_exists: ${fs4.existsSync(getPolicyPath(process.cwd()))}`,
           `mcp_exists: ${fs4.existsSync(getMcpConfigPath(process.cwd()))}`,
-          `memory_exists: ${fs4.existsSync(getMemoryPath())}`,
+          `memory_user_exists: ${fs4.existsSync(getMemoryPath())}`,
+          `memory_project_exists: ${fs4.existsSync(getProjectMemoryPath(process.cwd()))}`,
           `audit_exists: ${fs4.existsSync(getAuditPath())}`
         ].join("\n");
         pushAssistant(checks, setHistory, onHistoryChange);
@@ -1282,7 +1609,8 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
           `config: ${getConfigPath()}`,
           `policy: ${getPolicyPath(process.cwd())}`,
           `mcp: ${getMcpConfigPath(process.cwd())}`,
-          `memory: ${getMemoryPath()}`,
+          `memory_user: ${getMemoryPath()}`,
+          `memory_project: ${getProjectMemoryPath(process.cwd())}`,
           `audit: ${getAuditPath()}`,
           `approvals: ${getApprovalPath()}`
         ].join("\n");
@@ -1301,13 +1629,21 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         return true;
       }
       if (content === "/memory") {
-        const memory = readMemory();
-        pushAssistant(memory || `No memory notes. Path: ${getMemoryPath()}`, setHistory, onHistoryChange);
+        setMemoryPickerOpen(true);
+        setMemoryPickerCursor(0);
+        setError(null);
+        setInput("");
         return true;
       }
-      if (content === "/memory clear") {
-        clearMemory();
-        pushAssistant("Memory cleared.", setHistory, onHistoryChange);
+      if (content.startsWith("/memory ")) {
+        const args = content.replace("/memory ", "").trim().split(/\s+/).filter(Boolean);
+        const scope = parseMemoryScope((args[0] ?? "").toLowerCase());
+        if (!scope) {
+          pushAssistant("Usage:\n/memory\n/memory user\n/memory project", setHistory, onHistoryChange);
+          return true;
+        }
+        ensureMemoryFile(scope, process.cwd());
+        void openMemoryByScope(scope);
         return true;
       }
       if (content === "/mcp") {
@@ -1382,8 +1718,8 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         const next = content.replace("/mode ", "").trim();
         if (SUPPORTED_MODES.includes(next)) {
           setRuntime((prev) => ({ ...prev, mode: next }));
+          setModeIndicator({ mode: next, source: "command", updatedAt: Date.now() });
           setError(null);
-          pushAssistant(`Switched mode to: ${next}`, setHistory, onHistoryChange);
         } else {
           setError(`Invalid mode: ${next}. Allowed: ${SUPPORTED_MODES.join(", ")}`);
         }
@@ -1440,15 +1776,7 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         return true;
       }
       if (content.startsWith("/resume ")) {
-        const id = content.replace("/resume ", "").trim();
-        const switched = switchSession(id, process.cwd());
-        if (!switched) {
-          pushAssistant(`Session not found: ${id}`, setHistory, onHistoryChange);
-          return true;
-        }
-        applySwitchedSession(switched);
-        closeResumePicker();
-        pushAssistant(`Resumed session: ${switched.id} (${switched.name})`, setHistory, onHistoryChange);
+        pushAssistant("Usage: /resume (no id needed). Pick one from the list.", setHistory, onHistoryChange);
         return true;
       }
       if (content.startsWith("/rewind ")) {
@@ -1526,6 +1854,7 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
       history,
       onHistoryChange,
       runAgentTask,
+      openMemoryByScope,
       runtime
     ]
   );
@@ -1536,6 +1865,10 @@ ${list.map((s) => `- ${s}`).join("\n")}` : `No session approvals. Path: ${getApp
     }
     if (resumePickerOpen) {
       confirmResumeSelection();
+      return;
+    }
+    if (memoryPickerOpen) {
+      confirmMemorySelection();
       return;
     }
     const content = input.trim();
@@ -1593,10 +1926,12 @@ Use /help`, setHistory, onHistoryChange);
     onHistoryChange,
     runAgentTask,
     confirmResumeSelection,
+    confirmMemorySelection,
     confirmUserQuestion,
     setInputAtEnd,
     suggestionIndex,
     resumePickerOpen,
+    memoryPickerOpen,
     pendingUserQuestion
   ]);
   const visibleResumeCandidates = useMemo(() => {
@@ -1782,7 +2117,8 @@ Use /help`, setHistory, onHistoryChange);
         /* @__PURE__ */ jsx(Text, { color: "green", children: ">" }),
         /* @__PURE__ */ jsx(TextInput, { value: input, onChange: setInput, onSubmit: submit }, inputKey),
         inlineParamPlaceholder ? /* @__PURE__ */ jsx(Text, { color: "gray", children: inlineParamPlaceholder }) : null
-      ] })
+      ] }),
+      /* @__PURE__ */ jsx(Text, { color: "yellow", children: modeIndicator.source === "init" ? `Current mode: ${modeIndicator.mode}` : `Mode switched (${modeIndicator.source === "hotkey" ? "Shift+Tab" : "/mode"}): ${modeIndicator.mode}` })
     ] }),
     inputSuggestions.length > 0 ? /* @__PURE__ */ jsxs(Box, { flexDirection: "column", children: [
       /* @__PURE__ */ jsx(Text, { color: "white", children: "Command Hints" }),
@@ -1812,17 +2148,30 @@ Use /help`, setHistory, onHistoryChange);
       /* @__PURE__ */ jsx(Text, { color: "white", children: "Resume Sessions (\u2191/\u2193 choose, Enter confirm, Esc cancel)" }),
       visibleResumeCandidates.map((item) => {
         const selected = resumeCandidates[resumeCursor]?.id === item.id;
+        const absoluteEditedAt = formatAbsoluteTime(item.updatedAt);
+        const relativeEditedAt = formatRelativeTime(item.updatedAt);
         return /* @__PURE__ */ jsxs(Text, { color: selected ? "cyan" : "white", children: [
           selected ? ">" : " ",
           " ",
           item.name,
-          " [",
-          item.id,
-          "] ",
-          item.updatedAt,
-          " msgs:",
+          " last:",
+          absoluteEditedAt,
+          " (",
+          relativeEditedAt,
+          ") msgs:",
           item.messages.length
         ] }, item.id);
+      })
+    ] }) : null,
+    memoryPickerOpen ? /* @__PURE__ */ jsxs(Box, { marginTop: 1, flexDirection: "column", width: contentWidth, children: [
+      /* @__PURE__ */ jsx(Text, { color: "white", children: "Memory Files (\u2191/\u2193 choose, Enter open, Esc cancel)" }),
+      memoryPickerItems.map((item, idx) => {
+        const selected = idx === memoryPickerCursor;
+        return /* @__PURE__ */ jsxs(Text, { color: selected ? "cyan" : "white", children: [
+          selected ? ">" : " ",
+          " ",
+          item.label
+        ] }, item.scope);
       })
     ] }) : null
   ] });
@@ -1930,7 +2279,7 @@ program.command("chat").description("Single-turn non-interactive chat").required
       allowedTools,
       disallowedTools,
       systemPrompt: options.systemPrompt,
-      appendSystemPrompt: options.appendSystemPrompt,
+      appendSystemPrompt: [options.appendSystemPrompt ?? "", buildRuntimeMemoryPrompt(process.cwd())].filter(Boolean).join("\n\n") || void 0,
       mcpTools,
       mcpCall: (fullName, args) => mcpManager.callTool(fullName, args),
       enableAudit: options.audit !== false
