@@ -30,6 +30,8 @@ export type SessionRecord = {
   activePlanId?: string;
   activeTaskSetId?: string;
   planSolvePhase?: 'planning' | 'solving' | 'completed' | 'paused';
+  activePlanVersion?: number;
+  lastOrchestratorStep?: 'planning' | 'tasking' | 'replanning';
   inputHistory?: InputHistoryEntry[];
 };
 
@@ -82,6 +84,8 @@ function normalizeRecord(record: SessionRecord): SessionRecord {
       : [],
     oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
     planSolvePhase: record.planSolvePhase ?? 'planning',
+    activePlanVersion: typeof record.activePlanVersion === 'number' ? record.activePlanVersion : 1,
+    lastOrchestratorStep: record.lastOrchestratorStep ?? 'planning',
     inputHistory: normalizeInputHistory(record.inputHistory)
   };
 }
@@ -375,6 +379,8 @@ export function bindPlanToActiveSession(
   active.activePlanId = planId;
   active.activeTaskSetId = taskSetId;
   active.planSolvePhase = phase;
+  active.activePlanVersion = active.activePlanVersion ?? 1;
+  active.lastOrchestratorStep = phase === 'solving' ? 'tasking' : 'planning';
   saveSessionRecord(active);
   return active;
 }
@@ -385,6 +391,22 @@ export function setActiveSessionPlanPhase(
 ): SessionRecord {
   const active = loadActiveSession(cwd);
   active.planSolvePhase = phase;
+  active.lastOrchestratorStep = phase === 'solving' ? 'tasking' : phase === 'planning' ? 'planning' : active.lastOrchestratorStep;
+  saveSessionRecord(active);
+  return active;
+}
+
+export function setActiveSessionPlanRuntimeState(
+  state: { planVersion?: number; orchestratorStep?: 'planning' | 'tasking' | 'replanning' },
+  cwd = process.cwd()
+): SessionRecord {
+  const active = loadActiveSession(cwd);
+  if (typeof state.planVersion === 'number' && Number.isFinite(state.planVersion)) {
+    active.activePlanVersion = Math.max(1, Math.floor(state.planVersion));
+  }
+  if (state.orchestratorStep) {
+    active.lastOrchestratorStep = state.orchestratorStep;
+  }
   saveSessionRecord(active);
   return active;
 }
@@ -393,6 +415,8 @@ export function clearActiveSessionPlanBinding(cwd = process.cwd()): SessionRecor
   const active = loadActiveSession(cwd);
   delete active.activePlanId;
   delete active.activeTaskSetId;
+  delete active.activePlanVersion;
+  delete active.lastOrchestratorStep;
   active.planSolvePhase = 'planning';
   saveSessionRecord(active);
   return active;
@@ -421,6 +445,8 @@ export function forkActiveSession(name?: string, cwd = process.cwd()): SessionRe
     activePlanId: active.activePlanId,
     activeTaskSetId: active.activeTaskSetId,
     planSolvePhase: active.planSolvePhase ?? 'planning',
+    activePlanVersion: active.activePlanVersion,
+    lastOrchestratorStep: active.lastOrchestratorStep,
     inputHistory: [...(active.inputHistory ?? [])]
   };
   saveSessionRecord(clone);

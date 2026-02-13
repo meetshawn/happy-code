@@ -3,6 +3,7 @@ import React from 'react';
 import { Command } from 'commander';
 import { render } from 'ink';
 import { HappyCodeAgent } from './agent.js';
+import { runTriadReview } from './agents/index.js';
 import { MultiAgentRuntime } from './agents_runtime.js';
 import { clearGlobalCommandApprovals, getApprovalPath, getGlobalApprovalPrefixes } from './approvals.js';
 import { getAuditPath, readRecentAudit } from './audit.js';
@@ -268,32 +269,21 @@ program
     }
 
     const agent = new HappyCodeAgent(cfg);
-    const runtime = new MultiAgentRuntime(agent);
-    const results = await runtime.runTasks(
-      [{ role: 'user', content: options.message }],
-      [
-        {
-          name: 'planner',
-          mode: 'plan',
-          prompt: 'Create a detailed implementation plan with risks.'
-        },
-        {
-          name: 'coder',
-          mode: 'edit',
-          prompt: 'Provide concrete code-level changes to implement the request.'
-        },
-        {
-          name: 'reviewer',
-          mode: 'plan',
-          prompt: 'Review the proposed approach and list potential issues.'
-        }
-      ],
-      {
-        cwd: process.cwd(),
-        enableAudit: true,
-        maxTurns: 5
+    const triad = await runTriadReview(agent, options.message, {
+      cwd: process.cwd(),
+      enableAudit: true,
+      maxTurns: 5
+    });
+    const results = triad.map((item) => ({
+      name: item.name,
+      mode: item.mode,
+      output: item.output,
+      io: {
+        summary: item.summary,
+        taskStateDelta: item.meta.taskStateDelta,
+        replanDecision: item.meta.replanDecision
       }
-    );
+    }));
 
     process.stdout.write(`${MultiAgentRuntime.formatResults(results)}\n`);
   });

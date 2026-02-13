@@ -10,3 +10,11 @@ export {
   allowGlobalCommandPrefix,
   isGloballyApprovedCommand
 } from './approvals.js';
+export {
+  runIsolatedAgentTurn,
+  runPlanAgent,
+  runTaskAgent,
+  runReviewerAgent,
+  runCoderAgent,
+  runTriadReview
+} from './agents/index.js';

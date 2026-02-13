@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 import {
   HappyCodeAgent,
+  MAX_TOP_LEVEL_TASKS,
   SUPPORTED_MODES,
   allowGlobalCommandPrefix,
   appendInputHistoryEntry,
   approveCommandForSession,
   approveCommandOnce,
   bindPlanToActiveSession,
-  buildRuntimeMemoryPrompt,
   clearActiveSessionPlanBinding,
   clearGlobalCommandApprovals,
   clearSession,
   clearSessionApprovals,
+  createPlanArtifactsDetailed,
   createSession,
   ensureMemoryFile,
+  ensureSolvingTaskConsistency,
   forkActiveSession,
   getApprovalPath,
   getAuditPath,
@@ -32,19 +34,26 @@ import {
   loadSessionById,
   loadSessionMessages,
   loadSessionToolEvents,
+  loadTaskSnapshot,
   openMemoryFile,
+  parseReplanDecision,
+  parseTaskOutcomeFromAssistantReply,
   readConfig,
   readRecentAudit,
   renameActiveSession,
   rewindActiveSession,
+  runIsolatedAgentTurn,
+  runTriadReview,
   saveSessionMessages,
   saveSessionToolEvents,
   setActiveSessionPlanPhase,
+  setActiveSessionPlanRuntimeState,
   switchSession,
+  updateCurrentTaskOutcome,
   writeConfig,
   writeDefaultGlobalPolicy,
   writeDefaultPolicy
-} from "./chunk-4U5RDCXH.js";
+} from "./chunk-ZLJHZEV7.js";
 
 // src/cli.ts
 import React2 from "react";
@@ -56,24 +65,61 @@ var MultiAgentRuntime = class {
   constructor(agent) {
     this.agent = agent;
   }
+  async runSubAgentTurn(task, role, context, baseMessages = []) {
+    const result = await runIsolatedAgentTurn(
+      this.agent,
+      {
+        role,
+        name: task.name,
+        mode: task.mode,
+        prompt: task.prompt,
+        baseMessages
+      },
+      {
+        cwd: context.cwd,
+        enableAudit: context.enableAudit,
+        model: context.model,
+        fallbackModel: context.fallbackModel,
+        maxTurns: context.maxTurns,
+        allowedTools: context.allowedTools,
+        disallowedTools: context.disallowedTools,
+        systemPrompt: context.systemPrompt,
+        appendSystemPrompt: context.appendSystemPrompt
+      },
+      {
+        mcpTools: context.mcpTools,
+        mcpCall: context.mcpCall,
+        onUserQuestion: context.onUserQuestion,
+        abortSignal: context.abortSignal,
+        onDelta: context.onDelta,
+        onToolEvent: context.onToolEvent
+      }
+    );
+    return {
+      name: task.name,
+      mode: task.mode,
+      output: result.output,
+      io: {
+        summary: result.summary,
+        taskStateDelta: result.meta.taskStateDelta ?? (role === "tasker" ? parseTaskOutcomeFromAssistantReply(result.output) ?? void 0 : void 0),
+        replanDecision: result.meta.replanDecision ?? (role === "replanner" ? parseReplanDecision(result.output) : void 0)
+      }
+    };
+  }
   async runTasks(baseMessages, tasks, context) {
     const outputs = [];
     for (const task of tasks) {
-      const result = await this.agent.chatStream(
-        [...baseMessages, { role: "user", content: task.prompt }],
+      const result = await this.runSubAgentTurn(
+        task,
+        task.name,
         {
-          mode: task.mode,
           cwd: context.cwd,
           enableAudit: context.enableAudit,
-          maxTurns: context.maxTurns ?? 12,
-          appendSystemPrompt: buildRuntimeMemoryPrompt(context.cwd)
-        }
+          maxTurns: context.maxTurns
+        },
+        baseMessages
       );
-      outputs.push({
-        name: task.name,
-        mode: task.mode,
-        output: result
-      });
+      outputs.push(result);
     }
     return outputs;
   }
@@ -262,618 +308,15 @@ var McpClientManager = class {
 };
 
 // src/ui.tsx
-import fs4 from "fs";
-import path4 from "path";
+import fs3 from "fs";
+import path3 from "path";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import TextInput from "ink-text-input";
 
-// src/plan_mode_state.ts
-import fs2 from "fs";
-import os from "os";
-import path2 from "path";
-var HAPPYCODE_ROOT = path2.join(os.homedir(), ".happycode");
-var PLANS_DIR = path2.join(HAPPYCODE_ROOT, "plans");
-var TASKS_DIR = path2.join(HAPPYCODE_ROOT, "tasks");
-var SNAPSHOT_DIR = path2.join(PLANS_DIR, ".snapshots");
-var META_START = "<!-- HAPPYCODE_PLAN_META_START -->";
-var META_END = "<!-- HAPPYCODE_PLAN_META_END -->";
-function nowIso() {
-  return (/* @__PURE__ */ new Date()).toISOString();
-}
-function ensureStorageDirs() {
-  fs2.mkdirSync(PLANS_DIR, { recursive: true });
-  fs2.mkdirSync(TASKS_DIR, { recursive: true });
-  fs2.mkdirSync(SNAPSHOT_DIR, { recursive: true });
-}
-function randomId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-function planMarkdownPath(planId) {
-  return path2.join(PLANS_DIR, `${planId}.md`);
-}
-function planMetaPath(planId) {
-  return path2.join(PLANS_DIR, `${planId}.meta.json`);
-}
-function taskSnapshotPath(planId) {
-  return path2.join(TASKS_DIR, `${planId}.json`);
-}
-function taskEventsPath(planId) {
-  return path2.join(TASKS_DIR, `${planId}.events.ndjson`);
-}
-function writeJson(filePath, payload) {
-  fs2.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}
-`, "utf8");
-}
-function appendTaskEvent(planId, event) {
-  fs2.appendFileSync(taskEventsPath(planId), `${JSON.stringify(event)}
-`, "utf8");
-}
-function computeStats(items) {
-  return {
-    total: items.length,
-    todo: items.filter((item) => item.status === "todo").length,
-    doing: items.filter((item) => item.status === "doing").length,
-    done: items.filter((item) => item.status === "done").length,
-    blocked: items.filter((item) => item.status === "blocked").length
-  };
-}
-function computeProgress(items) {
-  const total = items.length;
-  const done = items.filter((item) => item.status === "done").length;
-  const percent = total > 0 ? Number((done / total * 100).toFixed(1)) : 0;
-  return {
-    done,
-    total,
-    percent
-  };
-}
-function findCurrentTaskId(items) {
-  return items.find((item) => item.status === "doing")?.id;
-}
-function normalizeTitle(raw) {
-  return raw.replace(/^[\-\*]\s*(?:\[[ xX\-]\]\s*)?/, "").replace(/^\d+[\.)\]:：]\s*/, "").trim();
-}
-function extractPlanItems(planText) {
-  const lines = planText.replace(/\r\n/g, "\n").split("\n");
-  const items = lines.map((line) => line.trim()).filter(Boolean).filter((line) => /^[-*]\s+\S+/.test(line) || /^\d+[\.)\]:：]\s+\S+/.test(line)).map(normalizeTitle).filter((title) => title.length > 0);
-  return Array.from(new Set(items));
-}
-function statusToCheckbox(status) {
-  if (status === "done") {
-    return "[x]";
-  }
-  if (status === "doing") {
-    return "[-]";
-  }
-  return "[ ]";
-}
-function checkboxToStatus(checkbox, blockedReason) {
-  if (checkbox === "[x]") {
-    return "done";
-  }
-  if (checkbox === "[-]") {
-    return "doing";
-  }
-  return blockedReason ? "blocked" : "todo";
-}
-function renderPlanMarkdown(meta, items) {
-  const lines = [];
-  lines.push(`# Task Plan: ${meta.planId}`);
-  lines.push("");
-  lines.push(META_START);
-  lines.push(JSON.stringify(meta, null, 2));
-  lines.push(META_END);
-  lines.push("");
-  lines.push("## Meta");
-  lines.push(`- plan_id: ${meta.planId}`);
-  lines.push(`- session_id: ${meta.sessionId}`);
-  lines.push(`- phase: ${meta.phase}`);
-  lines.push(`- created_at: ${meta.createdAt}`);
-  lines.push(`- updated_at: ${meta.updatedAt}`);
-  lines.push("");
-  lines.push("## Steps");
-  for (const item of items) {
-    lines.push(`- ${statusToCheckbox(item.status)} ${item.id} ${item.title}`);
-    if (item.notes) {
-      lines.push(`  - note: ${item.notes}`);
-    }
-    if (item.blockedReason) {
-      lines.push(`  - blocked: ${item.blockedReason}`);
-    }
-    if (item.startedAt) {
-      lines.push(`  - started_at: ${item.startedAt}`);
-    }
-    if (item.completedAt) {
-      lines.push(`  - completed_at: ${item.completedAt}`);
-    }
-  }
-  lines.push("");
-  lines.push("## Execution Log");
-  lines.push("- initialized");
-  lines.push("");
-  return `${lines.join("\n")}`;
-}
-function parseMetaBlock(markdown) {
-  const start = markdown.indexOf(META_START);
-  const end = markdown.indexOf(META_END);
-  if (start < 0 || end < 0 || end <= start) {
-    return null;
-  }
-  const body = markdown.slice(start + META_START.length, end).trim();
-  if (!body) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(body);
-    if (!parsed || typeof parsed.planId !== "string") {
-      return null;
-    }
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-function parseItems(markdown) {
-  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
-  const items = [];
-  let current = null;
-  for (const rawLine of lines) {
-    const line = rawLine.trimEnd();
-    const stepMatch = line.match(/^\s*[-*]\s*(\[[ xX\-]\])\s+(task_\d+)\s+(.+)$/);
-    if (stepMatch) {
-      const checkbox = stepMatch[1].toLowerCase() === "[x]" ? "[x]" : stepMatch[1] === "[-]" ? "[-]" : "[ ]";
-      const item = {
-        id: stepMatch[2],
-        title: stepMatch[3].trim(),
-        status: checkboxToStatus(checkbox),
-        updatedAt: nowIso()
-      };
-      items.push(item);
-      current = item;
-      continue;
-    }
-    if (!current) {
-      continue;
-    }
-    const noteMatch = line.match(/^\s*[-*]\s+note:\s*(.+)$/i);
-    if (noteMatch) {
-      current.notes = noteMatch[1].trim();
-      continue;
-    }
-    const blockedMatch = line.match(/^\s*[-*]\s+blocked:\s*(.+)$/i);
-    if (blockedMatch) {
-      current.blockedReason = blockedMatch[1].trim();
-      current.status = "blocked";
-      continue;
-    }
-    const startedMatch = line.match(/^\s*[-*]\s+started_at:\s*(.+)$/i);
-    if (startedMatch) {
-      current.startedAt = startedMatch[1].trim();
-      continue;
-    }
-    const completedMatch = line.match(/^\s*[-*]\s+completed_at:\s*(.+)$/i);
-    if (completedMatch) {
-      current.completedAt = completedMatch[1].trim();
-      continue;
-    }
-  }
-  return items;
-}
-function parsePlanMarkdown(planId) {
-  const filePath = planMarkdownPath(planId);
-  if (!fs2.existsSync(filePath)) {
-    return null;
-  }
-  const body = fs2.readFileSync(filePath, "utf8");
-  const meta = parseMetaBlock(body);
-  if (!meta) {
-    return null;
-  }
-  const items = parseItems(body);
-  const bodyLines = body.replace(/\r\n/g, "\n").split("\n");
-  return {
-    meta,
-    items,
-    bodyLines
-  };
-}
-function writePlanMarkdown(planId, meta, items, logLine) {
-  const filePath = planMarkdownPath(planId);
-  const existing = fs2.existsSync(filePath) ? fs2.readFileSync(filePath, "utf8") : "";
-  const next = renderPlanMarkdown(meta, items);
-  const logSegment = existing.includes("## Execution Log") ? existing.slice(existing.indexOf("## Execution Log")).split("\n").slice(1).filter((line) => line.trim().length > 0) : [];
-  if (logLine) {
-    logSegment.push(`- ${logLine}`);
-  }
-  const merged = `${next.replace(/\n\s*## Execution Log\n- initialized\n?\s*$/m, "")}
-## Execution Log
-${logSegment.length > 0 ? logSegment.join("\n") : "- initialized"}
-`;
-  if (existing) {
-    const snapDir = path2.join(SNAPSHOT_DIR, planId);
-    fs2.mkdirSync(snapDir, { recursive: true });
-    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[\:\.]/g, "-");
-    fs2.writeFileSync(path2.join(snapDir, `${stamp}.md`), existing, "utf8");
-    const snapshots = fs2.readdirSync(snapDir).filter((name) => name.endsWith(".md")).sort();
-    if (snapshots.length > 20) {
-      for (const old of snapshots.slice(0, snapshots.length - 20)) {
-        fs2.unlinkSync(path2.join(snapDir, old));
-      }
-    }
-  }
-  fs2.writeFileSync(filePath, merged, "utf8");
-}
-function toSnapshot(meta, items) {
-  const normalizedItems = items.map((item) => ({
-    ...item,
-    status: item.blockedReason ? item.status === "done" ? "done" : "blocked" : item.status
-  }));
-  const stats = computeStats(normalizedItems);
-  const progress = computeProgress(normalizedItems);
-  const phase = meta.phase !== "completed" && progress.total > 0 && progress.done === progress.total && stats.blocked === 0 ? "completed" : meta.phase;
-  const currentTaskId = meta.currentTaskId ?? findCurrentTaskId(normalizedItems);
-  return {
-    planId: meta.planId,
-    sessionId: meta.sessionId,
-    phase,
-    items: normalizedItems,
-    progress,
-    currentTaskId,
-    lastUpdatedTaskId: meta.lastUpdatedTaskId,
-    blockedCount: stats.blocked,
-    stats,
-    createdAt: meta.createdAt,
-    updatedAt: meta.updatedAt
-  };
-}
-function migrateLegacyJsonIfNeeded(planId) {
-  const markdownFile = planMarkdownPath(planId);
-  if (fs2.existsSync(markdownFile)) {
-    return false;
-  }
-  const legacyPath = taskSnapshotPath(planId);
-  if (!fs2.existsSync(legacyPath)) {
-    return false;
-  }
-  try {
-    const legacy = JSON.parse(fs2.readFileSync(legacyPath, "utf8"));
-    if (!legacy || !Array.isArray(legacy.items) || typeof legacy.sessionId !== "string") {
-      return false;
-    }
-    ensureStorageDirs();
-    const meta = {
-      planId,
-      sessionId: legacy.sessionId,
-      phase: legacy.phase ?? "planning",
-      createdAt: legacy.createdAt ?? nowIso(),
-      updatedAt: legacy.updatedAt ?? nowIso(),
-      currentTaskId: legacy.currentTaskId,
-      lastUpdatedTaskId: legacy.lastUpdatedTaskId
-    };
-    writePlanMarkdown(planId, meta, legacy.items, "migrated_from_json");
-    appendTaskEvent(planId, {
-      eventType: "migrated_from_json",
-      planId,
-      ts: nowIso(),
-      source: "migration"
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-function createPlanArtifacts(args) {
-  const steps = extractPlanItems(args.planText);
-  if (steps.length < 2) {
-    return null;
-  }
-  ensureStorageDirs();
-  const createdAt = nowIso();
-  const planId = args.planId ?? randomId();
-  const meta = {
-    planId,
-    sessionId: args.sessionId,
-    phase: "planning",
-    createdAt,
-    updatedAt: createdAt,
-    sourcePrompt: args.sourcePrompt
-  };
-  const items = steps.map((title, index) => ({
-    id: `task_${index + 1}`,
-    title,
-    status: "todo",
-    updatedAt: createdAt
-  }));
-  writeJson(planMetaPath(planId), {
-    ...meta,
-    sourcePrompt: args.sourcePrompt
-  });
-  writePlanMarkdown(planId, meta, items, "plan_created");
-  appendTaskEvent(planId, {
-    eventType: "plan_created",
-    planId,
-    ts: createdAt,
-    source: "mode_plan"
-  });
-  const snapshot = toSnapshot(meta, items);
-  writeJson(taskSnapshotPath(planId), snapshot);
-  return {
-    planId,
-    snapshot
-  };
-}
-function loadTaskSnapshot(planId) {
-  ensureStorageDirs();
-  migrateLegacyJsonIfNeeded(planId);
-  const parsed = parsePlanMarkdown(planId);
-  if (!parsed) {
-    return null;
-  }
-  const snapshot = toSnapshot(parsed.meta, parsed.items);
-  writeJson(taskSnapshotPath(planId), snapshot);
-  return snapshot;
-}
-function saveTaskSnapshot(snapshot) {
-  ensureStorageDirs();
-  const meta = {
-    planId: snapshot.planId,
-    sessionId: snapshot.sessionId,
-    phase: snapshot.phase,
-    createdAt: snapshot.createdAt,
-    updatedAt: nowIso(),
-    currentTaskId: snapshot.currentTaskId,
-    lastUpdatedTaskId: snapshot.lastUpdatedTaskId
-  };
-  const items = snapshot.items.map((item) => ({ ...item, updatedAt: item.updatedAt || meta.updatedAt }));
-  writePlanMarkdown(snapshot.planId, meta, items, "snapshot_saved");
-  const next = toSnapshot(meta, items);
-  writeJson(taskSnapshotPath(snapshot.planId), next);
-  return next;
-}
-function enterSolvingPhase(planId, source = "ui") {
-  const snapshot = loadTaskSnapshot(planId);
-  if (!snapshot) {
-    return null;
-  }
-  const ts = nowIso();
-  const items = snapshot.items.map((item) => ({ ...item }));
-  let currentTaskId = snapshot.currentTaskId;
-  const existingDoing = items.find((item) => item.status === "doing");
-  if (!existingDoing) {
-    const firstTodo = items.find((item) => item.status === "todo");
-    if (firstTodo) {
-      firstTodo.status = "doing";
-      firstTodo.startedAt = firstTodo.startedAt ?? ts;
-      firstTodo.attempts = (firstTodo.attempts ?? 0) + 1;
-      firstTodo.updatedAt = ts;
-      currentTaskId = firstTodo.id;
-      appendTaskEvent(planId, {
-        eventType: "task_started",
-        planId,
-        taskId: firstTodo.id,
-        from: "todo",
-        to: "doing",
-        ts,
-        source
-      });
-    }
-  } else {
-    currentTaskId = existingDoing.id;
-  }
-  appendTaskEvent(planId, {
-    eventType: "phase_changed",
-    planId,
-    from: snapshot.phase,
-    to: "solving",
-    ts,
-    source
-  });
-  return saveTaskSnapshot({
-    ...snapshot,
-    phase: "solving",
-    currentTaskId,
-    lastUpdatedTaskId: currentTaskId,
-    items
-  });
-}
-function startNextTodoTask(planId, items, source) {
-  const nextItems = items.map((item) => ({ ...item }));
-  const nextTodo = nextItems.find((item) => item.status === "todo");
-  if (!nextTodo) {
-    return {
-      items: nextItems,
-      currentTaskId: void 0
-    };
-  }
-  const ts = nowIso();
-  nextTodo.status = "doing";
-  nextTodo.updatedAt = ts;
-  nextTodo.startedAt = nextTodo.startedAt ?? ts;
-  nextTodo.attempts = (nextTodo.attempts ?? 0) + 1;
-  appendTaskEvent(planId, {
-    eventType: "task_started",
-    planId,
-    taskId: nextTodo.id,
-    from: "todo",
-    to: "doing",
-    ts,
-    source
-  });
-  return {
-    items: nextItems,
-    currentTaskId: nextTodo.id
-  };
-}
-function updateCurrentTaskOutcome(planId, outcome, options) {
-  const snapshot = loadTaskSnapshot(planId);
-  if (!snapshot || snapshot.phase !== "solving") {
-    return snapshot;
-  }
-  const source = options?.source ?? "runtime";
-  const note = options?.note?.trim() ?? "";
-  const ts = nowIso();
-  const items = snapshot.items.map((item) => ({ ...item }));
-  const current = items.find((item) => item.status === "doing");
-  if (!current) {
-    return snapshot;
-  }
-  if (outcome === "doing") {
-    if (!note) {
-      return snapshot;
-    }
-    current.notes = note;
-    current.updatedAt = ts;
-    appendTaskEvent(planId, {
-      eventType: "task_note_updated",
-      planId,
-      taskId: current.id,
-      ts,
-      source,
-      note
-    });
-    return saveTaskSnapshot({
-      ...snapshot,
-      items,
-      currentTaskId: current.id,
-      lastUpdatedTaskId: current.id
-    });
-  }
-  if (outcome === "blocked") {
-    current.status = "blocked";
-    current.blockedReason = note || current.blockedReason;
-    current.notes = note || current.notes;
-    current.updatedAt = ts;
-    appendTaskEvent(planId, {
-      eventType: "task_blocked",
-      planId,
-      taskId: current.id,
-      from: "doing",
-      to: "blocked",
-      ts,
-      source,
-      note
-    });
-    return saveTaskSnapshot({
-      ...snapshot,
-      items,
-      currentTaskId: void 0,
-      lastUpdatedTaskId: current.id
-    });
-  }
-  current.status = "done";
-  current.completedAt = ts;
-  current.updatedAt = ts;
-  if (note) {
-    current.notes = note;
-  }
-  appendTaskEvent(planId, {
-    eventType: "task_completed",
-    planId,
-    taskId: current.id,
-    from: "doing",
-    to: "done",
-    ts,
-    source,
-    note
-  });
-  const withNext = startNextTodoTask(planId, items, source);
-  return saveTaskSnapshot({
-    ...snapshot,
-    items: withNext.items,
-    currentTaskId: withNext.currentTaskId,
-    lastUpdatedTaskId: current.id
-  });
-}
-function ensureSolvingTaskConsistency(planId, source = "self_heal") {
-  const snapshot = loadTaskSnapshot(planId);
-  if (!snapshot || snapshot.phase !== "solving") {
-    return snapshot;
-  }
-  const doingCount = snapshot.items.filter((item) => item.status === "doing").length;
-  if (doingCount > 0) {
-    return snapshot;
-  }
-  const hasTodo = snapshot.items.some((item) => item.status === "todo");
-  if (!hasTodo) {
-    return saveTaskSnapshot(snapshot);
-  }
-  const withNext = startNextTodoTask(planId, snapshot.items, source);
-  return saveTaskSnapshot({
-    ...snapshot,
-    items: withNext.items,
-    currentTaskId: withNext.currentTaskId
-  });
-}
-function parseTaskOutcomeFromAssistantReply(reply) {
-  const normalized = reply.replace(/\r\n/g, "\n");
-  const stateMatch = normalized.match(/^TASK_STATE:\s*(done|blocked|doing)\s*$/gim);
-  if (!stateMatch || stateMatch.length === 0) {
-    return null;
-  }
-  const lastStateLine = stateMatch[stateMatch.length - 1] ?? "";
-  const outcomeMatch = lastStateLine.match(/(done|blocked|doing)/i);
-  if (!outcomeMatch) {
-    return null;
-  }
-  const noteMatch = normalized.match(/^TASK_NOTE:\s*(.*)$/gim);
-  const note = noteMatch && noteMatch.length > 0 ? noteMatch[noteMatch.length - 1]?.replace(/^TASK_NOTE:\s*/i, "").trim() : "";
-  return {
-    outcome: outcomeMatch[1].toLowerCase(),
-    note: note || void 0
-  };
-}
-function formatTaskProgressLine(snapshot) {
-  const current = snapshot.items.find((item) => item.id === snapshot.currentTaskId);
-  return [
-    `plan=${snapshot.planId}`,
-    `phase=${snapshot.phase}`,
-    `progress=${snapshot.progress.done}/${snapshot.progress.total} (${snapshot.progress.percent}%)`,
-    `doing=${current ? current.title : "none"}`,
-    `blocked=${snapshot.blockedCount}`
-  ].join(" | ");
-}
-function sortByStatus(items) {
-  const order = {
-    doing: 0,
-    blocked: 1,
-    todo: 2,
-    done: 3
-  };
-  return [...items].sort((a, b) => {
-    const left = order[a.status] ?? 9;
-    const right = order[b.status] ?? 9;
-    if (left !== right) {
-      return left - right;
-    }
-    return a.id.localeCompare(b.id);
-  });
-}
-function formatTaskSummary(snapshot) {
-  const header = [
-    `plan_id: ${snapshot.planId}`,
-    `phase: ${snapshot.phase}`,
-    `progress: ${snapshot.progress.done}/${snapshot.progress.total} (${snapshot.progress.percent}%)`,
-    `stats: total=${snapshot.stats.total} todo=${snapshot.stats.todo} doing=${snapshot.stats.doing} blocked=${snapshot.stats.blocked} done=${snapshot.stats.done}`,
-    `current_task: ${snapshot.items.find((item) => item.id === snapshot.currentTaskId)?.title ?? "(none)"}`
-  ];
-  const rows = sortByStatus(snapshot.items).map(
-    (item) => `- [${item.status}] ${item.id} ${item.title}${item.notes ? ` (${item.notes})` : ""}${item.blockedReason ? ` [reason: ${item.blockedReason}]` : ""}`
-  );
-  return [...header, "", ...rows].join("\n");
-}
-function formatTaskTodos(snapshot) {
-  const lines = snapshot.items.map((item) => {
-    const checked = item.status === "done" ? "x" : item.status === "doing" ? "-" : " ";
-    const statusTag = item.status === "done" ? "" : ` (${item.status})`;
-    return `- [${checked}] ${item.title}${statusTag}`;
-  });
-  return lines.join("\n");
-}
-
 // src/rollback.ts
-import fs3 from "fs";
-import path3 from "path";
+import fs2 from "fs";
+import path2 from "path";
 import { execSync } from "child_process";
 function listFilesSafe(cwd) {
   try {
@@ -890,15 +333,15 @@ function listFilesSafe(cwd) {
   }
 }
 function fileExists(cwd, relPath) {
-  return fs3.existsSync(path3.join(cwd, relPath));
+  return fs2.existsSync(path2.join(cwd, relPath));
 }
 function readFileOptional(cwd, relPath) {
-  const full = path3.join(cwd, relPath);
-  if (!fs3.existsSync(full)) {
+  const full = path2.join(cwd, relPath);
+  if (!fs2.existsSync(full)) {
     return null;
   }
   try {
-    return fs3.readFileSync(full, "utf8");
+    return fs2.readFileSync(full, "utf8");
   } catch {
     return null;
   }
@@ -947,11 +390,11 @@ function rollbackCode(snapshot) {
   }
   for (const rel of touched) {
     const before = snapshot.fileContentsBefore[rel] ?? null;
-    const full = path3.join(snapshot.cwd, rel);
+    const full = path2.join(snapshot.cwd, rel);
     if (before === null) {
       if (fileExists(snapshot.cwd, rel)) {
         try {
-          fs3.unlinkSync(full);
+          fs2.unlinkSync(full);
         } catch (err) {
           return {
             ok: false,
@@ -962,8 +405,8 @@ function rollbackCode(snapshot) {
       continue;
     }
     try {
-      fs3.mkdirSync(path3.dirname(full), { recursive: true });
-      fs3.writeFileSync(full, before, "utf8");
+      fs2.mkdirSync(path2.dirname(full), { recursive: true });
+      fs2.writeFileSync(full, before, "utf8");
     } catch (err) {
       return {
         ok: false,
@@ -1009,8 +452,6 @@ var COMMANDS = [
   { cmd: "/new", complete: "/new", desc: "Start new conversation" },
   { cmd: "/compact", complete: "/compact", desc: "Compact context" },
   { cmd: "/review", complete: "/review", desc: "Review current git diff" },
-  { cmd: "/plan", complete: "/plan", desc: "Generate implementation plan" },
-  { cmd: "/solve", complete: "/solve", desc: "Enter solve phase for active plan" },
   { cmd: "/test [command]", complete: "/test", desc: "Run tests via tools" },
   { cmd: "/fix", complete: "/fix", desc: "Investigate and fix issues" },
   { cmd: "/theme", complete: "/theme ", desc: "Get or set UI theme" },
@@ -1026,8 +467,6 @@ var COMMANDS = [
   { cmd: "/context", complete: "/context", desc: "Show context summary" },
   { cmd: "/stats", complete: "/stats", desc: "Show local usage stats from audit log" },
   { cmd: "/usage", complete: "/usage", desc: "Alias for /stats" },
-  { cmd: "/tasks", complete: "/tasks", desc: "Summarize pending tasks" },
-  { cmd: "/todos", complete: "/todos", desc: "Generate TODO checklist" },
   { cmd: "/copy", complete: "/copy", desc: "Copy latest assistant response" },
   { cmd: "/debug", complete: "/debug", desc: "Show debug info" },
   { cmd: "/doctor", complete: "/doctor", desc: "Run environment checks" },
@@ -1051,6 +490,44 @@ var COMMANDS = [
   { cmd: "/clear", complete: "/clear", desc: "Clear conversation" },
   { cmd: "/exit", complete: "/exit", desc: "Quit" }
 ];
+var CORE_COMMANDS_SET = /* @__PURE__ */ new Set([
+  "/help",
+  "/new",
+  "/test [command]",
+  "/fix",
+  "/model [name]",
+  "/resume",
+  "/clear",
+  "/exit"
+]);
+var CORE_COMMANDS = COMMANDS.filter((item) => CORE_COMMANDS_SET.has(item.cmd));
+var MODE_HELP_TEXT = [
+  "Modes:",
+  "  plan  Analysis and implementation planning",
+  "  edit  Direct coding and code changes",
+  "  auto  Adaptive mode selection",
+  "Shortcut: Shift+Tab to cycle modes"
+].join("\n");
+function renderCommandHelp(commands) {
+  return commands.map((item) => `${item.cmd.padEnd(34, " ")} ${item.desc}`).join("\n");
+}
+function buildHelpText(scope) {
+  const title = scope === "all" ? "All Commands:" : "Core Commands:";
+  const hint = scope === "all" ? "Tip: use /help <command> for details." : "Tip: use /help all to see advanced commands.";
+  const source = scope === "all" ? COMMANDS : CORE_COMMANDS;
+  return [title, renderCommandHelp(source), "", hint, "", MODE_HELP_TEXT].join("\n");
+}
+function findCommandForHelp(query) {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) {
+    return void 0;
+  }
+  const exact = COMMANDS.find((item) => item.cmd.toLowerCase() === normalized || item.complete.trim().toLowerCase() === normalized);
+  if (exact) {
+    return exact;
+  }
+  return COMMANDS.find((item) => item.cmd.toLowerCase().startsWith(normalized));
+}
 var MODE_DISPLAY = {
   auto: {
     label: "Auto",
@@ -1068,20 +545,12 @@ var MODE_DISPLAY = {
     color: "green"
   }
 };
-var HELP_TEXT = [
-  COMMANDS.map((item) => `${item.cmd.padEnd(34, " ")} ${item.desc}`).join("\n"),
-  "",
-  "Modes:",
-  "  plan  Analysis and implementation planning",
-  "  edit  Direct coding and code changes",
-  "  auto  Adaptive mode selection",
-  "Shortcut: Shift+Tab to cycle modes"
-].join("\n");
 var MODE_CYCLE = ["plan", "edit", "auto"];
 var MAX_RENDER_FLOW_ITEMS = 120;
 var MAX_TOOL_EVENTS_STORE = 2e3;
 var MAX_PREVIEW_LINES = 5;
 var MAX_PREVIEW_CHARS = 560;
+var PLAN_PANEL_MAX_ITEMS = 8;
 function pad2(value) {
   return String(value).padStart(2, "0");
 }
@@ -1196,7 +665,7 @@ function getCommandParamHint(command) {
   return raw;
 }
 function getInlineParamPlaceholder(input) {
-  const matched = COMMANDS.find((item) => item.complete.endsWith(" ") && input === item.complete);
+  const matched = CORE_COMMANDS.find((item) => item.complete.endsWith(" ") && input === item.complete);
   if (!matched) {
     return "";
   }
@@ -1223,12 +692,18 @@ function parseMentionFiles(input, cwd) {
   const matches = [...input.matchAll(/@([^\s]+)/g)].map((m) => m[1]).filter(Boolean);
   const files = [];
   for (const item of matches) {
-    const full = path4.resolve(cwd, item);
-    if (fs4.existsSync(full) && fs4.statSync(full).isFile()) {
+    const full = path3.resolve(cwd, item);
+    if (fs3.existsSync(full) && fs3.statSync(full).isFile()) {
       files.push(item);
     }
   }
   return files;
+}
+function isSubAgentLogMessage(message) {
+  return message.role === "assistant" && /^\[subagent:/i.test(message.content.trim());
+}
+function stripSubAgentMessages(messages) {
+  return messages.filter((item) => !isSubAgentLogMessage(item));
 }
 function App({
   agent,
@@ -1274,7 +749,7 @@ function App({
   const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
   const [memoryPickerOpen, setMemoryPickerOpen] = useState(false);
   const [memoryPickerCursor, setMemoryPickerCursor] = useState(0);
-  const [taskProgressLine, setTaskProgressLine] = useState("");
+  const [taskSnapshot, setTaskSnapshot] = useState(null);
   const [rollbackArmedUntil, setRollbackArmedUntil] = useState(null);
   const [inputHistory, setInputHistory] = useState([]);
   const [historyBrowseActive, setHistoryBrowseActive] = useState(false);
@@ -1375,6 +850,7 @@ function App({
       title: pendingUserQuestion.title,
       meta: pendingUserQuestion.meta ?? {}
     };
+    const questionKind = typeof pendingUserQuestion.meta?.kind === "string" ? pendingUserQuestion.meta.kind : void 0;
     if (pendingUserQuestion.title === "Shell approval required") {
       const meta = pendingUserQuestion.meta ?? {};
       const command = typeof meta.command === "string" ? meta.command : "";
@@ -1396,7 +872,7 @@ function App({
     const resolver = pendingQuestionResolveRef.current;
     pendingQuestionResolveRef.current = null;
     closeUserQuestion();
-    if (pendingUserQuestion.title === "Rollback code as well?") {
+    if (questionKind === "rollback_confirm" || pendingUserQuestion.title === "Rollback code as well?") {
       const optionId = answer.optionId;
       const mode = optionId === "rollback_both" ? "both" : optionId === "rollback_dialogue" ? "dialogue_only" : "keep";
       const selectedId = typeof pendingUserQuestion.meta?.historyEntryId === "string" ? pendingUserQuestion.meta.historyEntryId : void 0;
@@ -1495,22 +971,22 @@ function App({
     },
     []
   );
-  const refreshTaskProgressLine = useCallback(() => {
+  const refreshTaskSnapshot = useCallback(() => {
     const active = loadActiveSession(process.cwd());
     if (!active.activePlanId) {
-      setTaskProgressLine("");
+      setTaskSnapshot(null);
       return;
     }
     const snapshot = loadTaskSnapshot(active.activePlanId);
     if (!snapshot) {
-      setTaskProgressLine("");
+      setTaskSnapshot(null);
       return;
     }
-    setTaskProgressLine(formatTaskProgressLine(snapshot));
+    setTaskSnapshot(snapshot);
   }, []);
   useEffect(() => {
-    refreshTaskProgressLine();
-  }, [history, refreshTaskProgressLine]);
+    refreshTaskSnapshot();
+  }, [history, refreshTaskSnapshot]);
   useEffect(() => {
     setInputHistory(getInputHistory(process.cwd()));
   }, []);
@@ -1575,7 +1051,12 @@ function App({
       return optionSuggestions.slice(0, 8);
     }
     const needle = trimmed.toLowerCase();
-    return COMMANDS.filter((item) => item.cmd.toLowerCase().startsWith(needle)).map((item) => ({
+    const coreMatches = CORE_COMMANDS.filter((item) => item.cmd.toLowerCase().startsWith(needle));
+    const advancedMatches = COMMANDS.filter(
+      (item) => !CORE_COMMANDS_SET.has(item.cmd) && item.cmd.toLowerCase().startsWith(needle)
+    );
+    const commandsToShow = coreMatches.length > 0 || needle === "/" ? coreMatches : [...coreMatches, ...advancedMatches];
+    return commandsToShow.map((item) => ({
       label: item.cmd,
       insert: item.complete,
       desc: item.desc,
@@ -1821,8 +1302,8 @@ function App({
       let enhancedPrompt = taskPrompt;
       if (mentionFiles.length > 0) {
         const inline = mentionFiles.map((file) => {
-          const full = path4.resolve(process.cwd(), file);
-          const content = fs4.readFileSync(full, "utf8").slice(0, 2e4);
+          const full = path3.resolve(process.cwd(), file);
+          const content = fs3.readFileSync(full, "utf8").slice(0, 2e4);
           return `
 [FILE: ${file}]
 ${content}`;
@@ -1832,7 +1313,7 @@ ${content}`;
 Referenced files content:${inline}`;
       }
       const userMessage = { role: "user", content: enhancedPrompt };
-      const nextHistory = [...history, userMessage];
+      const nextHistory = [...stripSubAgentMessages(history), userMessage];
       setHistory(nextHistory);
       onHistoryChange?.(nextHistory);
       setLoading(true);
@@ -1919,43 +1400,58 @@ Referenced files content:${inline}`;
             setToolEvents((prev) => [...prev.slice(-(MAX_TOOL_EVENTS_STORE - 1)), timelineEvent]);
           }
         );
-        let finalReply = reply;
+        const finalReply = reply;
+        setHistory((prev) => {
+          const assistantMessage = { role: "assistant", content: finalReply };
+          const updated = [...prev, assistantMessage];
+          onHistoryChange?.(updated);
+          return updated;
+        });
         if (effectiveMode === "plan") {
           const active = loadActiveSession(process.cwd());
-          const persisted = createPlanArtifacts({
+          const persisted = createPlanArtifactsDetailed({
             sessionId: active.id,
-            planText: reply,
+            planText: finalReply,
             sourcePrompt: taskPrompt
           });
-          if (persisted) {
-            bindPlanToActiveSession(persisted.planId, persisted.planId, "planning", process.cwd());
-            finalReply = `${reply}
-
----
-plan_state: saved
-plan_id: ${persisted.planId}
-phase: planning
-tasks: ${persisted.snapshot.stats.total}`;
-            setTaskProgressLine(formatTaskProgressLine(persisted.snapshot));
+          if (persisted.ok) {
+            bindPlanToActiveSession(persisted.value.planId, persisted.value.planId, "planning", process.cwd());
+            setActiveSessionPlanRuntimeState(
+              {
+                planVersion: persisted.value.snapshot.planVersion,
+                orchestratorStep: "planning"
+              },
+              process.cwd()
+            );
+            setTaskSnapshot(persisted.value.snapshot);
+          } else {
+            pushAssistant(
+              `Plan was not persisted: ${persisted.detail} Top-level markdown todos must be 3-${MAX_TOP_LEVEL_TASKS}.`,
+              setHistory,
+              onHistoryChange
+            );
           }
         } else {
           const active = loadActiveSession(process.cwd());
           if (active.activePlanId && active.planSolvePhase === "solving") {
-            const parsed = parseTaskOutcomeFromAssistantReply(reply);
+            const parsed = parseTaskOutcomeFromAssistantReply(finalReply);
             if (parsed) {
               const updated = updateCurrentTaskOutcome(active.activePlanId, parsed.outcome, {
                 note: parsed.note,
                 source: "assistant_reply"
               });
               if (updated) {
-                finalReply = `${reply}
-
----
-${formatTaskProgressLine(updated)}`;
                 if (updated.phase === "completed") {
                   setActiveSessionPlanPhase("completed", process.cwd());
                 }
-                setTaskProgressLine(formatTaskProgressLine(updated));
+                setActiveSessionPlanRuntimeState(
+                  {
+                    planVersion: updated.planVersion,
+                    orchestratorStep: updated.orchestratorStep ?? "tasking"
+                  },
+                  process.cwd()
+                );
+                setTaskSnapshot(updated);
               }
             } else {
               const healed = ensureSolvingTaskConsistency(active.activePlanId, "turn_consistency");
@@ -1963,17 +1459,18 @@ ${formatTaskProgressLine(updated)}`;
                 if (healed.phase === "completed") {
                   setActiveSessionPlanPhase("completed", process.cwd());
                 }
-                setTaskProgressLine(formatTaskProgressLine(healed));
+                setActiveSessionPlanRuntimeState(
+                  {
+                    planVersion: healed.planVersion,
+                    orchestratorStep: healed.orchestratorStep ?? "tasking"
+                  },
+                  process.cwd()
+                );
+                setTaskSnapshot(healed);
               }
             }
           }
         }
-        setHistory((prev) => {
-          const assistantMessage = { role: "assistant", content: finalReply };
-          const updated = [...prev, assistantMessage];
-          onHistoryChange?.(updated);
-          return updated;
-        });
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
           streamingFlushTimerRef.current = null;
@@ -1981,6 +1478,7 @@ ${formatTaskProgressLine(updated)}`;
         setStreaming(streamingBufferRef.current);
         setStreaming("");
         streamingBufferRef.current = "";
+        return finalReply;
       } catch (err) {
         pendingQuestionResolveRef.current = null;
         closeUserQuestion();
@@ -1990,6 +1488,7 @@ ${formatTaskProgressLine(updated)}`;
         } else {
           setError(message);
         }
+        return null;
       } finally {
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
@@ -2006,7 +1505,28 @@ ${formatTaskProgressLine(updated)}`;
   const handleSlashCommand = useCallback(
     (content) => {
       if (content === "/help") {
-        pushAssistant(HELP_TEXT, setHistory, onHistoryChange);
+        pushAssistant(buildHelpText("core"), setHistory, onHistoryChange);
+        return true;
+      }
+      if (content === "/help all") {
+        pushAssistant(buildHelpText("all"), setHistory, onHistoryChange);
+        return true;
+      }
+      if (content.startsWith("/help ")) {
+        const query = content.replace("/help ", "").trim();
+        const command = findCommandForHelp(query);
+        if (!command) {
+          pushAssistant(`Unknown command: ${query}
+Use /help for common commands, /help all for full list.`, setHistory, onHistoryChange);
+          return true;
+        }
+        const detail = [
+          `Command: ${command.cmd}`,
+          `Description: ${command.desc}`,
+          `Usage: ${command.cmd}`,
+          command.complete.endsWith(" ") ? `Completion prefix: ${command.complete}` : "Completion prefix: (none)"
+        ].join("\n");
+        pushAssistant(detail, setHistory, onHistoryChange);
         return true;
       }
       if (content === "/status") {
@@ -2024,7 +1544,7 @@ ${formatTaskProgressLine(updated)}`;
           `active_session: ${active.id} (${active.name})`,
           `active_plan: ${active.activePlanId ?? "(none)"}`,
           `plan_phase: ${active.planSolvePhase ?? "planning"}`,
-          `task_progress: ${taskProgressLine || "(none)"}`
+          `task_progress: ${taskSnapshot ? `${taskSnapshot.progress.done}/${taskSnapshot.progress.total} (${taskSnapshot.progress.percent}%)` : "(none)"}`
         ].join("\n");
         pushAssistant(status, setHistory, onHistoryChange);
         return true;
@@ -2094,19 +1614,19 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
       }
       if (content === "/doctor") {
         const checks = [
-          `config_exists: ${fs4.existsSync(getConfigPath())}`,
-          `policy_exists: ${fs4.existsSync(getPolicyPath(process.cwd()))}`,
-          `mcp_exists: ${fs4.existsSync(getMcpConfigPath(process.cwd()))}`,
-          `memory_user_exists: ${fs4.existsSync(getMemoryPath())}`,
-          `memory_project_exists: ${fs4.existsSync(getProjectMemoryPath(process.cwd()))}`,
-          `audit_exists: ${fs4.existsSync(getAuditPath())}`
+          `config_exists: ${fs3.existsSync(getConfigPath())}`,
+          `policy_exists: ${fs3.existsSync(getPolicyPath(process.cwd()))}`,
+          `mcp_exists: ${fs3.existsSync(getMcpConfigPath(process.cwd()))}`,
+          `memory_user_exists: ${fs3.existsSync(getMemoryPath())}`,
+          `memory_project_exists: ${fs3.existsSync(getProjectMemoryPath(process.cwd()))}`,
+          `audit_exists: ${fs3.existsSync(getAuditPath())}`
         ].join("\n");
         pushAssistant(checks, setHistory, onHistoryChange);
         return true;
       }
       if (content === "/new") {
         clearActiveSessionPlanBinding(process.cwd());
-        setTaskProgressLine("");
+        setTaskSnapshot(null);
         preTurnSnapshotRef.current = null;
         snapshotByHistoryIdRef.current.clear();
         setHistoryBrowseActive(false);
@@ -2139,31 +1659,6 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
         );
         return true;
       }
-      if (content === "/plan") {
-        void runAgentTask(
-          "Please produce a concrete implementation plan for the current task. Focus on ordered steps, risks, and validation strategy.",
-          "plan"
-        );
-        return true;
-      }
-      if (content === "/solve") {
-        const active = loadActiveSession(process.cwd());
-        const planId = active.activePlanId;
-        if (!planId) {
-          pushAssistant("No active plan is bound to this session yet.", setHistory, onHistoryChange);
-          return true;
-        }
-        const next = enterSolvingPhase(planId, "slash_solve");
-        if (!next) {
-          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
-          return true;
-        }
-        setActiveSessionPlanPhase("solving", process.cwd());
-        setTaskProgressLine(formatTaskProgressLine(next));
-        preTurnSnapshotRef.current = null;
-        pushAssistant(formatTaskSummary(next), setHistory, onHistoryChange);
-        return true;
-      }
       if (content.startsWith("/test")) {
         const custom = content.replace("/test", "").trim();
         const testPrompt = custom ? `Run this test command with tools: ${custom}. Summarize failures and likely root cause.` : "Detect and run the most appropriate test command for this project using tools. Summarize failures and likely root cause.";
@@ -2175,56 +1670,6 @@ Available: ${Object.keys(THEME_STYLES).join(", ")}`, setHistory, onHistoryChange
           "Investigate current project issues using available tools, implement a minimal fix, and explain what was changed and why.",
           "auto"
         );
-        return true;
-      }
-      if (content === "/tasks") {
-        const active = loadActiveSession(process.cwd());
-        const planId = active.activePlanId;
-        if (!planId) {
-          pushAssistant("No active plan state found. Use plan mode to generate a plan first.", setHistory, onHistoryChange);
-          return true;
-        }
-        const snapshot = loadTaskSnapshot(planId);
-        if (!snapshot) {
-          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
-          return true;
-        }
-        if (snapshot.phase === "solving") {
-          const healed = ensureSolvingTaskConsistency(planId, "slash_tasks") ?? snapshot;
-          setTaskProgressLine(formatTaskProgressLine(healed));
-          pushAssistant(formatTaskSummary(healed), setHistory, onHistoryChange);
-          return true;
-        }
-        setTaskProgressLine(formatTaskProgressLine(snapshot));
-        pushAssistant(formatTaskSummary(snapshot), setHistory, onHistoryChange);
-        return true;
-      }
-      if (content === "/todos") {
-        const active = loadActiveSession(process.cwd());
-        const planId = active.activePlanId;
-        if (!planId) {
-          pushAssistant("No active plan state found. Use plan mode to generate a plan first.", setHistory, onHistoryChange);
-          return true;
-        }
-        const snapshot = loadTaskSnapshot(planId);
-        if (!snapshot) {
-          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
-          return true;
-        }
-        if (snapshot.phase === "solving") {
-          const healed = ensureSolvingTaskConsistency(planId, "slash_todos") ?? snapshot;
-          setTaskProgressLine(formatTaskProgressLine(healed));
-          pushAssistant(`plan_id: ${healed.planId}
-phase: ${healed.phase}
-
-${formatTaskTodos(healed)}`, setHistory, onHistoryChange);
-          return true;
-        }
-        setTaskProgressLine(formatTaskProgressLine(snapshot));
-        pushAssistant(`plan_id: ${snapshot.planId}
-phase: ${snapshot.phase}
-
-${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
         return true;
       }
       if (content === "/copy") {
@@ -2260,7 +1705,7 @@ ${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
       }
       if (content === "/clear") {
         clearActiveSessionPlanBinding(process.cwd());
-        setTaskProgressLine("");
+        setTaskSnapshot(null);
         preTurnSnapshotRef.current = null;
         snapshotByHistoryIdRef.current.clear();
         setHistoryBrowseActive(false);
@@ -2323,32 +1768,35 @@ ${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
         const base = content.replace("/agents", "").trim();
         const prompt = base || "analyze current project and propose concrete implementation steps";
         void (async () => {
-          const runtimeAgent = new MultiAgentRuntime(agent);
-          const results = await runtimeAgent.runTasks(
-            [{ role: "user", content: prompt }],
-            [
-              {
-                name: "planner",
-                mode: "plan",
-                prompt: "Create a detailed implementation plan with risks."
-              },
-              {
-                name: "coder",
-                mode: "edit",
-                prompt: "Provide concrete code-level changes to implement the request."
-              },
-              {
-                name: "reviewer",
-                mode: "plan",
-                prompt: "Review the proposed approach and list potential issues."
-              }
-            ],
+          const resultsRaw = await runTriadReview(
+            agent,
+            prompt,
             {
               cwd: process.cwd(),
               enableAudit,
-              maxTurns: runtime.maxTurns
-            }
+              model: runtime.model,
+              fallbackModel: runtime.fallbackModel,
+              maxTurns: runtime.maxTurns,
+              allowedTools: runtime.allowedTools,
+              disallowedTools: runtime.disallowedTools,
+              systemPrompt: runtime.systemPrompt,
+              appendSystemPrompt: runtime.appendSystemPrompt
+            },
+            mcpManager ? {
+              mcpTools: await mcpManager.listTools(),
+              mcpCall: (fullName, args) => mcpManager.callTool(fullName, args)
+            } : void 0
           );
+          const results = resultsRaw.map((item) => ({
+            name: item.name,
+            mode: item.mode,
+            output: item.output,
+            io: {
+              summary: item.summary,
+              taskStateDelta: item.meta.taskStateDelta,
+              replanDecision: item.meta.replanDecision
+            }
+          }));
           pushAssistant(MultiAgentRuntime.formatResults(results), setHistory, onHistoryChange);
         })();
         return true;
@@ -2434,11 +1882,11 @@ ${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
       }
       if (content.startsWith("/export")) {
         const target = content.replace("/export", "").trim();
-        const outputPath = target || path4.join(process.cwd(), "happycode-export.md");
+        const outputPath = target || path3.join(process.cwd(), "happycode-export.md");
         const body = history.map((item) => `## ${item.role.toUpperCase()}
 
 ${item.content}`).join("\n\n");
-        fs4.writeFileSync(outputPath, `${body}
+        fs3.writeFileSync(outputPath, `${body}
 `, "utf8");
         pushAssistant(`Exported conversation to: ${outputPath}`, setHistory, onHistoryChange);
         return true;
@@ -2538,7 +1986,7 @@ ${item.content}`).join("\n\n");
       openMemoryByScope,
       rollbackHistoryPickerOpen,
       runtime,
-      taskProgressLine
+      taskSnapshot
     ]
   );
   const submit = useCallback(async () => {
@@ -2751,6 +2199,27 @@ Use /help`, setHistory, onHistoryChange);
     return rows.slice(-MAX_RENDER_FLOW_ITEMS);
   }, [history, toolStepsByTurn]);
   const modeDisplay = MODE_DISPLAY[runtime.mode] ?? MODE_DISPLAY.auto;
+  const sortedPlanItems = useMemo(() => {
+    if (!taskSnapshot) {
+      return [];
+    }
+    const order = {
+      doing: 0,
+      blocked: 1,
+      todo: 2,
+      done: 3
+    };
+    return [...taskSnapshot.items].sort((a, b) => {
+      const left = order[a.status] ?? 9;
+      const right = order[b.status] ?? 9;
+      if (left !== right) {
+        return left - right;
+      }
+      return a.id.localeCompare(b.id);
+    });
+  }, [taskSnapshot]);
+  const visiblePlanItems = sortedPlanItems.slice(0, PLAN_PANEL_MAX_ITEMS);
+  const hiddenPlanItems = Math.max(0, sortedPlanItems.length - visiblePlanItems.length);
   return /* @__PURE__ */ jsxs(Box, { flexDirection: "column", padding: 1, children: [
     /* @__PURE__ */ jsxs(Box, { borderStyle: "round", borderColor: themeStyle.titleColor, paddingX: 1, flexDirection: "column", width: contentWidth, children: [
       /* @__PURE__ */ jsx(Text, { color: themeStyle.titleColor, children: ":) HappyCode" }),
@@ -2813,6 +2282,32 @@ Use /help`, setHistory, onHistoryChange);
         /* @__PURE__ */ jsx(Text, { color: "gray", children: flowSeparator })
       ] }) : null
     ] }),
+    taskSnapshot ? /* @__PURE__ */ jsxs(Box, { marginTop: 1, flexDirection: "column", width: contentWidth, children: [
+      /* @__PURE__ */ jsxs(Box, { children: [
+        /* @__PURE__ */ jsx(Text, { color: "gray", children: "* " }),
+        /* @__PURE__ */ jsxs(Text, { color: "cyan", children: [
+          "Updated Plan (",
+          visiblePlanItems.length,
+          "/",
+          taskSnapshot.items.length,
+          ")"
+        ] })
+      ] }),
+      visiblePlanItems.map((item) => {
+        const marker = item.status === "done" ? "[x]" : "[ ]";
+        const color = item.status === "doing" ? "cyan" : item.status === "blocked" ? "yellow" : "gray";
+        const suffix = item.status === "blocked" ? " (blocked)" : "";
+        return /* @__PURE__ */ jsxs(Text, { color, children: [
+          "  ",
+          " ",
+          marker,
+          " ",
+          item.title,
+          suffix
+        ] }, item.id);
+      }),
+      hiddenPlanItems > 0 ? /* @__PURE__ */ jsx(Text, { color: "gray", children: `  ... ${hiddenPlanItems} more tasks.` }) : null
+    ] }) : null,
     loading ? /* @__PURE__ */ jsx(Box, { marginTop: 1, children: /* @__PURE__ */ jsx(Text, { color: "yellow", children: "Thinking..." }) }) : null,
     error ? /* @__PURE__ */ jsx(Box, { marginTop: 1, children: /* @__PURE__ */ jsxs(Text, { color: "red", children: [
       "Error: ",
@@ -2833,10 +2328,6 @@ Use /help`, setHistory, onHistoryChange);
           " (Shift+Tab to cycle)"
         ] })
       ] }),
-      taskProgressLine ? /* @__PURE__ */ jsxs(Box, { marginTop: 1, children: [
-        /* @__PURE__ */ jsx(Text, { color: "cyan", children: "Task Progress: " }),
-        /* @__PURE__ */ jsx(Text, { color: "gray", children: taskProgressLine })
-      ] }) : null,
       historyBrowseActive ? /* @__PURE__ */ jsx(Box, { children: /* @__PURE__ */ jsxs(Text, { color: "gray", children: [
         "Input History: ",
         (historyBrowseIndex ?? 0) + 1,
@@ -3097,32 +2588,21 @@ program.command("agents").description("Run multi-agent orchestration tasks").req
     process.exit(1);
   }
   const agent = new HappyCodeAgent(cfg);
-  const runtime = new MultiAgentRuntime(agent);
-  const results = await runtime.runTasks(
-    [{ role: "user", content: options.message }],
-    [
-      {
-        name: "planner",
-        mode: "plan",
-        prompt: "Create a detailed implementation plan with risks."
-      },
-      {
-        name: "coder",
-        mode: "edit",
-        prompt: "Provide concrete code-level changes to implement the request."
-      },
-      {
-        name: "reviewer",
-        mode: "plan",
-        prompt: "Review the proposed approach and list potential issues."
-      }
-    ],
-    {
-      cwd: process.cwd(),
-      enableAudit: true,
-      maxTurns: 5
+  const triad = await runTriadReview(agent, options.message, {
+    cwd: process.cwd(),
+    enableAudit: true,
+    maxTurns: 5
+  });
+  const results = triad.map((item) => ({
+    name: item.name,
+    mode: item.mode,
+    output: item.output,
+    io: {
+      summary: item.summary,
+      taskStateDelta: item.meta.taskStateDelta,
+      replanDecision: item.meta.replanDecision
     }
-  );
+  }));
   process.stdout.write(`${MultiAgentRuntime.formatResults(results)}
 `);
 });

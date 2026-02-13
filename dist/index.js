@@ -15,10 +15,16 @@ import {
   loadPolicy,
   readConfig,
   readRecentAudit,
+  runCoderAgent,
+  runIsolatedAgentTurn,
+  runPlanAgent,
+  runReviewerAgent,
+  runTaskAgent,
+  runTriadReview,
   writeConfig,
   writeDefaultGlobalPolicy,
   writeDefaultPolicy
-} from "./chunk-4U5RDCXH.js";
+} from "./chunk-ZLJHZEV7.js";
 export {
   HappyCodeAgent,
   SUPPORTED_MODES,
@@ -36,6 +42,12 @@ export {
   loadPolicy,
   readConfig,
   readRecentAudit,
+  runCoderAgent,
+  runIsolatedAgentTurn,
+  runPlanAgent,
+  runReviewerAgent,
+  runTaskAgent,
+  runTriadReview,
   writeConfig,
   writeDefaultGlobalPolicy,
   writeDefaultPolicy

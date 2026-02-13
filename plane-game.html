@@ -198,10 +198,10 @@
 
         <div id="menu">
             <h1>✈️ 飞机大战</h1>
-            <p>击落敌机，获得高分！</p>
+            <p>击落敌机，获取高分！</p>
             <button onclick="startGame()">开始游戏</button>
             <div class="controls-info">
-                <span>↑↓←→</span> 或 <span>WASD</span> 移动<br>
+                <span>←→↑↓</span> 或 <span>WASD</span> 移动<br>
                 <span>空格</span> 射击<br>
                 <span>P</span> 暂停
             </div>
@@ -614,7 +614,7 @@
                     ctx.globalAlpha = 0.5;
                 }
 
-                // 机身
+                // 机翼
                 const gradient = ctx.createLinearGradient(0, -this.height / 2, 0, this.height / 2);
                 gradient.addColorStop(0, '#4a90d9');
                 gradient.addColorStop(0.5, '#357abd');
@@ -631,7 +631,7 @@
                 ctx.closePath();
                 ctx.fill();
 
-                // 机翼
+                // 侧翼
                 ctx.fillStyle = '#357abd';
                 ctx.beginPath();
                 ctx.moveTo(-this.width / 4, 0);
@@ -689,7 +689,7 @@
                     updateUI();
                     audio.playHit();
                     
-                    // 创建受伤特效
+                    // 创建受伤效果
                     for (let i = 0; i < 10; i++) {
                         particles.push(new Particle(this.x, this.y, 'rgb(255, 71, 87)'));
                     }
@@ -741,7 +741,7 @@
             for (let i = 0; i < gameState.lives; i++) {
                 livesHtml += '❤️';
             }
-            document.getElementById('lives').textContent = livesHtml || '💔';
+            document.getElementById('lives').textContent = livesHtml || '💀';
         }
 
         // ==================== 更新等级 ====================
@@ -866,7 +866,7 @@
             particles = [];
             stars = [];
 
-            // 创建星星背景
+            // 创建星空背景
             for (let i = 0; i < 50; i++) {
                 stars.push(new Star());
             }
@@ -921,7 +921,7 @@
                     pauseGame();
                 }
             }
-
+            
             // 防止空格键滚动页面
             if (e.code === 'Space') {
                 e.preventDefault();
@@ -932,61 +932,34 @@
             keys[e.code] = false;
         });
 
-        // ==================== 触摸控制（移动设备） ====================
-        let touchStartX = 0;
-        let touchStartY = 0;
-
-        canvas.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            const touch = e.touches[0];
-            touchStartX = touch.clientX;
-            touchStartY = touch.clientY;
-            
-            // 初始化音频
-            audio.init();
-            
-            // 自动射击
-            keys['Space'] = true;
-        });
-
-        canvas.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            const touch = e.touches[0];
-            const deltaX = touch.clientX - touchStartX;
-            const deltaY = touch.clientY - touchStartY;
-
-            if (player) {
-                player.x += deltaX;
-                player.y += deltaY;
-                
-                // 边界检测
-                player.x = Math.max(player.width / 2, Math.min(WIDTH - player.width / 2, player.x));
-                player.y = Math.max(player.height / 2, Math.min(HEIGHT - player.height / 2, player.y));
-            }
-
-            touchStartX = touch.clientX;
-            touchStartY = touch.clientY;
-        });
-
-        canvas.addEventListener('touchend', (e) => {
-            e.preventDefault();
-            keys['Space'] = false;
-        });
-
-        // ==================== 初始化背景星星 ====================
-        function initBackground() {
-            ctx.fillStyle = '#0a0a1a';
-            ctx.fillRect(0, 0, WIDTH, HEIGHT);
-            
-            for (let i = 0; i < 50; i++) {
-                const star = new Star();
-                star.y = Math.random() * HEIGHT;
-                star.draw();
-            }
+        // 初始化星空背景
+        for (let i = 0; i < 50; i++) {
+            stars.push(new Star());
         }
 
-        // 页面加载完成后初始化背景
-        initBackground();
+        // 绘制初始背景
+        function drawInitialBackground() {
+            ctx.fillStyle = '#0a0a1a';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+            stars.forEach(star => star.draw());
+        }
+        drawInitialBackground();();
+                }
+            }
+        });
+
+        // ==================== 键盘松开事件 ====================
+        document.addEventListener('keyup', (e) => {
+            keys[e.code] = false;
+        });
+
+        // ==================== 防止空格键滚动页面 ====================
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'ArrowDown' || 
+                e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+                e.preventDefault();
+            }
+        });
     </script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-import fs from 'node:fs';
+﻿import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -21,6 +21,9 @@ export type TaskStateSnapshot = {
   planId: string;
   sessionId: string;
   phase: PlanSolvePhase;
+  planVersion: number;
+  lastReplanReason?: string;
+  orchestratorStep?: 'planning' | 'tasking' | 'replanning';
   items: TaskItem[];
   progress: {
     done: number;
@@ -45,6 +48,16 @@ type TaskEvent = {
   eventType:
     | 'plan_created'
     | 'phase_changed'
+    | 'replan_requested'
+    | 'replan_applied'
+    | 'replan_skipped'
+    | 'subagent_turn_started'
+    | 'subagent_turn_finished'
+    | 'subagent_output_parsed'
+    | 'subagent_output_parse_failed'
+    | 'orchestrator_transition'
+    | 'task_agent_turn_started'
+    | 'task_agent_turn_finished'
     | 'task_started'
     | 'task_completed'
     | 'task_blocked'
@@ -65,6 +78,28 @@ export type PlanPersistResult = {
   snapshot: TaskStateSnapshot;
 };
 
+export type PlanParseError = 'invalid_todo_format' | 'too_few_tasks' | 'too_many_tasks';
+
+export type PlanParseResult = {
+  items: string[];
+  error?: PlanParseError;
+  detail?: string;
+};
+
+export type PlanPersistDetailedResult =
+  | {
+      ok: true;
+      value: PlanPersistResult;
+    }
+  | {
+      ok: false;
+      error: PlanParseError;
+      detail: string;
+    };
+
+export const MIN_TOP_LEVEL_TASKS = 3;
+export const MAX_TOP_LEVEL_TASKS = 8;
+
 const HAPPYCODE_ROOT = path.join(os.homedir(), '.happycode');
 const PLANS_DIR = path.join(HAPPYCODE_ROOT, 'plans');
 const TASKS_DIR = path.join(HAPPYCODE_ROOT, 'tasks');
@@ -77,6 +112,9 @@ type PlanMeta = {
   planId: string;
   sessionId: string;
   phase: PlanSolvePhase;
+  planVersion?: number;
+  lastReplanReason?: string;
+  orchestratorStep?: 'planning' | 'tasking' | 'replanning';
   createdAt: string;
   updatedAt: string;
   sourcePrompt?: string;
@@ -128,6 +166,18 @@ function appendTaskEvent(planId: string, event: TaskEvent): void {
   fs.appendFileSync(taskEventsPath(planId), `${JSON.stringify(event)}\n`, 'utf8');
 }
 
+export function recordTaskEvent(
+  planId: string,
+  event: Omit<TaskEvent, 'planId' | 'ts'> & { ts?: string }
+): void {
+  ensureStorageDirs();
+  appendTaskEvent(planId, {
+    ...event,
+    planId,
+    ts: event.ts ?? nowIso()
+  });
+}
+
 function computeStats(items: TaskItem[]): TaskStateSnapshot['stats'] {
   return {
     total: items.length,
@@ -153,23 +203,58 @@ function findCurrentTaskId(items: TaskItem[]): string | undefined {
   return items.find((item) => item.status === 'doing')?.id;
 }
 
-function normalizeTitle(raw: string): string {
-  return raw
-    .replace(/^[\-\*]\s*(?:\[[ xX\-]\]\s*)?/, '')
-    .replace(/^\d+[\.)\]:：]\s*/, '')
-    .trim();
+function extractProposedPlanBody(planText: string): string {
+  const match = planText.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i);
+  return match ? match[1] : planText;
 }
 
-function extractPlanItems(planText: string): string[] {
-  const lines = planText.replace(/\r\n/g, '\n').split('\n');
-  const items = lines
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => /^[-*]\s+\S+/.test(line) || /^\d+[\.)\]:：]\s+\S+/.test(line))
-    .map(normalizeTitle)
-    .filter((title) => title.length > 0);
-
+export function extractStrictTodoItems(planText: string): string[] {
+  const body = extractProposedPlanBody(planText).replace(/\r\n/g, '\n');
+  const lines = body.split('\n');
+  const items: string[] = [];
+  for (const rawLine of lines) {
+    if (!rawLine.trim()) {
+      continue;
+    }
+    if (rawLine !== rawLine.trimStart()) {
+      continue;
+    }
+    const match = rawLine.match(/^[-*]\s+\[(?: |x|X|-)\]\s+(.+)$/);
+    if (!match) {
+      continue;
+    }
+    const title = match[1].trim().replace(/\s+/g, ' ');
+    if (title) {
+      items.push(title);
+    }
+  }
   return Array.from(new Set(items));
+}
+
+export function parsePlanTodoItems(planText: string): PlanParseResult {
+  const items = extractStrictTodoItems(planText);
+  if (items.length === 0) {
+    return {
+      items: [],
+      error: 'invalid_todo_format',
+      detail: 'No top-level markdown todo items found. Use "- [ ] <task>" lines.'
+    };
+  }
+  if (items.length < MIN_TOP_LEVEL_TASKS) {
+    return {
+      items,
+      error: 'too_few_tasks',
+      detail: `Expected at least ${MIN_TOP_LEVEL_TASKS} top-level tasks, got ${items.length}.`
+    };
+  }
+  if (items.length > MAX_TOP_LEVEL_TASKS) {
+    return {
+      items,
+      error: 'too_many_tasks',
+      detail: `Expected at most ${MAX_TOP_LEVEL_TASKS} top-level tasks, got ${items.length}.`
+    };
+  }
+  return { items };
 }
 
 function statusToCheckbox(status: TaskStatus): '[ ]' | '[x]' | '[-]' {
@@ -204,6 +289,13 @@ function renderPlanMarkdown(meta: PlanMeta, items: TaskItem[]): string {
   lines.push(`- plan_id: ${meta.planId}`);
   lines.push(`- session_id: ${meta.sessionId}`);
   lines.push(`- phase: ${meta.phase}`);
+  lines.push(`- plan_version: ${meta.planVersion ?? 1}`);
+  if (meta.lastReplanReason) {
+    lines.push(`- last_replan_reason: ${meta.lastReplanReason}`);
+  }
+  if (meta.orchestratorStep) {
+    lines.push(`- orchestrator_step: ${meta.orchestratorStep}`);
+  }
   lines.push(`- created_at: ${meta.createdAt}`);
   lines.push(`- updated_at: ${meta.updatedAt}`);
   lines.push('');
@@ -369,6 +461,9 @@ function toSnapshot(meta: PlanMeta, items: TaskItem[]): TaskStateSnapshot {
     planId: meta.planId,
     sessionId: meta.sessionId,
     phase,
+    planVersion: Math.max(1, meta.planVersion ?? 1),
+    lastReplanReason: meta.lastReplanReason,
+    orchestratorStep: meta.orchestratorStep,
     items: normalizedItems,
     progress,
     currentTaskId,
@@ -399,6 +494,9 @@ function migrateLegacyJsonIfNeeded(planId: string): boolean {
       planId,
       sessionId: legacy.sessionId,
       phase: legacy.phase ?? 'planning',
+      planVersion: legacy.planVersion ?? 1,
+      lastReplanReason: legacy.lastReplanReason,
+      orchestratorStep: legacy.orchestratorStep,
       createdAt: legacy.createdAt ?? nowIso(),
       updatedAt: legacy.updatedAt ?? nowIso(),
       currentTaskId: legacy.currentTaskId,
@@ -417,16 +515,21 @@ function migrateLegacyJsonIfNeeded(planId: string): boolean {
   }
 }
 
-export function createPlanArtifacts(args: {
+export function createPlanArtifactsDetailed(args: {
   sessionId: string;
   planText: string;
   sourcePrompt: string;
   planId?: string;
-}): PlanPersistResult | null {
-  const steps = extractPlanItems(args.planText);
-  if (steps.length < 2) {
-    return null;
+}): PlanPersistDetailedResult {
+  const parsed = parsePlanTodoItems(args.planText);
+  if (parsed.error) {
+    return {
+      ok: false,
+      error: parsed.error,
+      detail: parsed.detail ?? parsed.error
+    };
   }
+  const steps = parsed.items;
 
   ensureStorageDirs();
   const createdAt = nowIso();
@@ -435,6 +538,8 @@ export function createPlanArtifacts(args: {
     planId,
     sessionId: args.sessionId,
     phase: 'planning',
+    planVersion: 1,
+    orchestratorStep: 'planning',
     createdAt,
     updatedAt: createdAt,
     sourcePrompt: args.sourcePrompt
@@ -463,9 +568,22 @@ export function createPlanArtifacts(args: {
   writeJson(taskSnapshotPath(planId), snapshot);
 
   return {
-    planId,
-    snapshot
+    ok: true,
+    value: {
+      planId,
+      snapshot
+    }
   };
+}
+
+export function createPlanArtifacts(args: {
+  sessionId: string;
+  planText: string;
+  sourcePrompt: string;
+  planId?: string;
+}): PlanPersistResult | null {
+  const detailed = createPlanArtifactsDetailed(args);
+  return detailed.ok ? detailed.value : null;
 }
 
 export function loadTaskSnapshot(planId: string): TaskStateSnapshot | null {
@@ -486,6 +604,9 @@ export function saveTaskSnapshot(snapshot: TaskStateSnapshot): TaskStateSnapshot
     planId: snapshot.planId,
     sessionId: snapshot.sessionId,
     phase: snapshot.phase,
+    planVersion: snapshot.planVersion,
+    lastReplanReason: snapshot.lastReplanReason,
+    orchestratorStep: snapshot.orchestratorStep,
     createdAt: snapshot.createdAt,
     updatedAt: nowIso(),
     currentTaskId: snapshot.currentTaskId,
@@ -542,6 +663,7 @@ export function enterSolvingPhase(planId: string, source = 'ui'): TaskStateSnaps
   return saveTaskSnapshot({
     ...snapshot,
     phase: 'solving',
+    orchestratorStep: 'tasking',
     currentTaskId,
     lastUpdatedTaskId: currentTaskId,
     items
@@ -718,7 +840,9 @@ export function formatTaskProgressLine(snapshot: TaskStateSnapshot): string {
   const current = snapshot.items.find((item) => item.id === snapshot.currentTaskId);
   return [
     `plan=${snapshot.planId}`,
+    `v=${snapshot.planVersion}`,
     `phase=${snapshot.phase}`,
+    `step=${snapshot.orchestratorStep ?? 'tasking'}`,
     `progress=${snapshot.progress.done}/${snapshot.progress.total} (${snapshot.progress.percent}%)`,
     `doing=${current ? current.title : 'none'}`,
     `blocked=${snapshot.blockedCount}`
@@ -745,7 +869,10 @@ function sortByStatus(items: TaskItem[]): TaskItem[] {
 export function formatTaskSummary(snapshot: TaskStateSnapshot): string {
   const header = [
     `plan_id: ${snapshot.planId}`,
+    `plan_version: ${snapshot.planVersion}`,
     `phase: ${snapshot.phase}`,
+    `orchestrator_step: ${snapshot.orchestratorStep ?? '(none)'}`,
+    `last_replan_reason: ${snapshot.lastReplanReason ?? '(none)'}`,
     `progress: ${snapshot.progress.done}/${snapshot.progress.total} (${snapshot.progress.percent}%)`,
     `stats: total=${snapshot.stats.total} todo=${snapshot.stats.todo} doing=${snapshot.stats.doing} blocked=${snapshot.stats.blocked} done=${snapshot.stats.done}`,
     `current_task: ${snapshot.items.find((item) => item.id === snapshot.currentTaskId)?.title ?? '(none)'}`
@@ -766,5 +893,108 @@ export function formatTaskTodos(snapshot: TaskStateSnapshot): string {
     return `- [${checked}] ${item.title}${statusTag}`;
   });
   return lines.join('\n');
+}
+
+function normalizeCompareTitle(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function rebasePlanItems(existing: TaskItem[], nextTitles: string[], ts: string): TaskItem[] {
+  const exactByTitle = new Map(existing.map((item) => [item.title, item]));
+  const normalizedByTitle = new Map(existing.map((item) => [normalizeCompareTitle(item.title), item]));
+  const usedIds = new Set<string>();
+  const next: TaskItem[] = [];
+
+  for (const [index, title] of nextTitles.entries()) {
+    const exact = exactByTitle.get(title);
+    const fuzzy = normalizedByTitle.get(normalizeCompareTitle(title));
+    const matched = exact ?? fuzzy;
+    const id = `task_${index + 1}`;
+    if (matched) {
+      usedIds.add(matched.id);
+      next.push({
+        ...matched,
+        id,
+        title,
+        status: matched.status === 'done' ? 'done' : 'todo',
+        updatedAt: ts
+      });
+      continue;
+    }
+
+    next.push({
+      id,
+      title,
+      status: 'todo',
+      updatedAt: ts
+    });
+  }
+
+  const carry = existing.filter((item) => !usedIds.has(item.id) && (item.status === 'blocked' || item.status === 'done'));
+  for (const item of carry) {
+    next.push({
+      ...item,
+      id: `task_${next.length + 1}`,
+      updatedAt: ts
+    });
+  }
+
+  return next;
+}
+
+export function applyReplanArtifacts(args: {
+  planId: string;
+  planText: string;
+  reason: string;
+  source?: string;
+}): TaskStateSnapshot | null {
+  const snapshot = loadTaskSnapshot(args.planId);
+  if (!snapshot) {
+    return null;
+  }
+  const source = args.source ?? 'replanner';
+  const parsed = parsePlanTodoItems(args.planText);
+  if (parsed.error) {
+    recordTaskEvent(args.planId, {
+      eventType: 'replan_skipped',
+      source,
+      note: `invalid_new_plan:${parsed.error}:${parsed.detail ?? parsed.error}`
+    });
+    return snapshot;
+  }
+  const nextTitles = parsed.items;
+
+  const ts = nowIso();
+  const nextItems = rebasePlanItems(snapshot.items, nextTitles, ts);
+
+  recordTaskEvent(args.planId, {
+    eventType: 'replan_applied',
+    source,
+    note: args.reason,
+    from: `v${snapshot.planVersion}`,
+    to: `v${snapshot.planVersion + 1}`,
+    ts
+  });
+
+  const saved = saveTaskSnapshot({
+    ...snapshot,
+    phase: snapshot.phase === 'completed' ? 'planning' : snapshot.phase,
+    planVersion: snapshot.planVersion + 1,
+    lastReplanReason: args.reason,
+    orchestratorStep: 'replanning',
+    currentTaskId: undefined,
+    lastUpdatedTaskId: snapshot.lastUpdatedTaskId,
+    updatedAt: ts,
+    items: nextItems
+  });
+
+  if (saved.phase === 'solving') {
+    return ensureSolvingTaskConsistency(saved.planId, source);
+  }
+  return saved;
 }
 

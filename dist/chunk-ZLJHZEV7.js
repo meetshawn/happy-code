@@ -283,6 +283,8 @@ function normalizeRecord(record) {
     sessionApprovedCommandPrefixes: Array.isArray(record.sessionApprovedCommandPrefixes) ? record.sessionApprovedCommandPrefixes : [],
     oneTimeApprovedCommands: Array.isArray(record.oneTimeApprovedCommands) ? record.oneTimeApprovedCommands : [],
     planSolvePhase: record.planSolvePhase ?? "planning",
+    activePlanVersion: typeof record.activePlanVersion === "number" ? record.activePlanVersion : 1,
+    lastOrchestratorStep: record.lastOrchestratorStep ?? "planning",
     inputHistory: normalizeInputHistory(record.inputHistory)
   };
 }
@@ -531,12 +533,26 @@ function bindPlanToActiveSession(planId, taskSetId, phase = "planning", cwd = pr
   active.activePlanId = planId;
   active.activeTaskSetId = taskSetId;
   active.planSolvePhase = phase;
+  active.activePlanVersion = active.activePlanVersion ?? 1;
+  active.lastOrchestratorStep = phase === "solving" ? "tasking" : "planning";
   saveSessionRecord(active);
   return active;
 }
 function setActiveSessionPlanPhase(phase, cwd = process.cwd()) {
   const active = loadActiveSession(cwd);
   active.planSolvePhase = phase;
+  active.lastOrchestratorStep = phase === "solving" ? "tasking" : phase === "planning" ? "planning" : active.lastOrchestratorStep;
+  saveSessionRecord(active);
+  return active;
+}
+function setActiveSessionPlanRuntimeState(state, cwd = process.cwd()) {
+  const active = loadActiveSession(cwd);
+  if (typeof state.planVersion === "number" && Number.isFinite(state.planVersion)) {
+    active.activePlanVersion = Math.max(1, Math.floor(state.planVersion));
+  }
+  if (state.orchestratorStep) {
+    active.lastOrchestratorStep = state.orchestratorStep;
+  }
   saveSessionRecord(active);
   return active;
 }
@@ -544,6 +560,8 @@ function clearActiveSessionPlanBinding(cwd = process.cwd()) {
   const active = loadActiveSession(cwd);
   delete active.activePlanId;
   delete active.activeTaskSetId;
+  delete active.activePlanVersion;
+  delete active.lastOrchestratorStep;
   active.planSolvePhase = "planning";
   saveSessionRecord(active);
   return active;
@@ -570,6 +588,8 @@ function forkActiveSession(name, cwd = process.cwd()) {
     activePlanId: active.activePlanId,
     activeTaskSetId: active.activeTaskSetId,
     planSolvePhase: active.planSolvePhase ?? "planning",
+    activePlanVersion: active.activePlanVersion,
+    lastOrchestratorStep: active.lastOrchestratorStep,
     inputHistory: [...active.inputHistory ?? []]
   };
   saveSessionRecord(clone);
@@ -1737,10 +1757,776 @@ var HappyCodeAgent = class {
   }
 };
 
-// src/config.ts
+// src/agents/agent_runner.ts
+function summarizeOutput(raw) {
+  const firstNonEmpty = raw.replace(/\r\n/g, "\n").split("\n").map((line) => line.trim()).find((line) => line.length > 0);
+  return firstNonEmpty ? firstNonEmpty.slice(0, 220) : "(empty output)";
+}
+async function runIsolatedAgentTurn(agent, request, context, options) {
+  const baseMessages = [...request.baseMessages ?? []];
+  const output = await agent.chatStream(
+    [...baseMessages, { role: "user", content: request.prompt }],
+    {
+      mode: request.mode,
+      cwd: context.cwd,
+      enableAudit: context.enableAudit,
+      model: context.model,
+      fallbackModel: context.fallbackModel,
+      maxTurns: context.maxTurns ?? 12,
+      allowedTools: context.allowedTools,
+      disallowedTools: context.disallowedTools,
+      systemPrompt: context.systemPrompt,
+      appendSystemPrompt: [context.appendSystemPrompt ?? "", buildRuntimeMemoryPrompt(context.cwd)].filter(Boolean).join("\n\n"),
+      mcpTools: options?.mcpTools,
+      mcpCall: options?.mcpCall,
+      onUserQuestion: options?.onUserQuestion,
+      abortSignal: options?.abortSignal
+    },
+    options?.onDelta,
+    options?.onToolEvent
+  );
+  return {
+    role: request.role,
+    name: request.name ?? request.role,
+    mode: request.mode,
+    prompt: request.prompt,
+    output,
+    summary: summarizeOutput(output),
+    meta: {}
+  };
+}
+function asNamedResult(result, role, name, meta) {
+  return {
+    ...result,
+    role,
+    name,
+    meta
+  };
+}
+
+// src/plan_runtime.ts
+function stripFence(text) {
+  return text.replace(/^```(?:markdown|md|text)?\s*/i, "").replace(/\s*```$/i, "").trim();
+}
+function buildPlannerPrompt(userPrompt) {
+  return [
+    "You are plan-agent. Produce an executable implementation plan only.",
+    'Output only a top-level markdown todo checklist in this exact format: "- [ ] <task>".',
+    "Top-level tasks must be 3-8 items, one-line, implementation-oriented, and coarse-grained.",
+    "Do not output numbered lists, nested bullets, sections, commentary, or code fences.",
+    "If scope is complex, keep top-level tasks coarse and let task-agent split/execute details later.",
+    "Do not implement. Do not run commands. Do not write files.",
+    `User goal:
+${userPrompt}`
+  ].join("\n\n");
+}
+function buildTaskAgentPrompt(snapshot) {
+  const current = snapshot.items.find((item) => item.id === snapshot.currentTaskId) ?? snapshot.items.find((item) => item.status === "todo");
+  const currentTaskText = current ? current.title : "Pick the highest-priority todo task.";
+  return [
+    "You are task-agent. Solve exactly one current task in this turn.",
+    "Make concrete progress for that task only.",
+    `Current task: ${currentTaskText}`,
+    `Plan summary:
+plan_id=${snapshot.planId} version=${snapshot.planVersion} phase=${snapshot.phase} progress=${snapshot.progress.done}/${snapshot.progress.total}`,
+    "At the end, append TASK_STATE: done|blocked|doing and optional TASK_NOTE: <short note>."
+  ].join("\n\n");
+}
+function parseReplanDecision(reply) {
+  const normalized = reply.replace(/\r\n/g, "\n");
+  const decisionMatch = normalized.match(/^REPLAN_DECISION:\s*(apply|skip)\s*$/im);
+  const reasonMatch = normalized.match(/^REPLAN_REASON:\s*(.+)\s*$/im);
+  const newPlanMatch = normalized.match(/NEW_PLAN:\s*([\s\S]*)$/im);
+  const decision = decisionMatch?.[1]?.toLowerCase() ?? "skip";
+  const reason = reasonMatch?.[1]?.trim() || "No significant drift detected.";
+  const planText = newPlanMatch ? stripFence(newPlanMatch[1] ?? "") : void 0;
+  const parseError = !decisionMatch ? "missing_decision" : !reasonMatch ? "missing_reason" : void 0;
+  return {
+    decision,
+    reason,
+    planText: planText && planText.length > 0 ? planText : void 0,
+    raw: reply,
+    parseError
+  };
+}
+
+// src/agents/plan_agent.ts
+async function runPlanAgent(agent, userGoal, context, options) {
+  const result = await runIsolatedAgentTurn(
+    agent,
+    {
+      role: "planner",
+      name: "planner",
+      mode: "plan",
+      prompt: buildPlannerPrompt(userGoal)
+    },
+    context,
+    options
+  );
+  return asNamedResult(result, "planner", "planner", {});
+}
+
+// src/plan_mode_state.ts
 import fs7 from "fs";
 import os6 from "os";
 import path7 from "path";
+var MIN_TOP_LEVEL_TASKS = 3;
+var MAX_TOP_LEVEL_TASKS = 8;
+var HAPPYCODE_ROOT = path7.join(os6.homedir(), ".happycode");
+var PLANS_DIR = path7.join(HAPPYCODE_ROOT, "plans");
+var TASKS_DIR = path7.join(HAPPYCODE_ROOT, "tasks");
+var SNAPSHOT_DIR = path7.join(PLANS_DIR, ".snapshots");
+var META_START = "<!-- HAPPYCODE_PLAN_META_START -->";
+var META_END = "<!-- HAPPYCODE_PLAN_META_END -->";
+function nowIso2() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function ensureStorageDirs() {
+  fs7.mkdirSync(PLANS_DIR, { recursive: true });
+  fs7.mkdirSync(TASKS_DIR, { recursive: true });
+  fs7.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+}
+function randomId2() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function planMarkdownPath(planId) {
+  return path7.join(PLANS_DIR, `${planId}.md`);
+}
+function planMetaPath(planId) {
+  return path7.join(PLANS_DIR, `${planId}.meta.json`);
+}
+function taskSnapshotPath(planId) {
+  return path7.join(TASKS_DIR, `${planId}.json`);
+}
+function taskEventsPath(planId) {
+  return path7.join(TASKS_DIR, `${planId}.events.ndjson`);
+}
+function writeJson(filePath, payload) {
+  fs7.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}
+`, "utf8");
+}
+function appendTaskEvent(planId, event) {
+  fs7.appendFileSync(taskEventsPath(planId), `${JSON.stringify(event)}
+`, "utf8");
+}
+function computeStats(items) {
+  return {
+    total: items.length,
+    todo: items.filter((item) => item.status === "todo").length,
+    doing: items.filter((item) => item.status === "doing").length,
+    done: items.filter((item) => item.status === "done").length,
+    blocked: items.filter((item) => item.status === "blocked").length
+  };
+}
+function computeProgress(items) {
+  const total = items.length;
+  const done = items.filter((item) => item.status === "done").length;
+  const percent = total > 0 ? Number((done / total * 100).toFixed(1)) : 0;
+  return {
+    done,
+    total,
+    percent
+  };
+}
+function findCurrentTaskId(items) {
+  return items.find((item) => item.status === "doing")?.id;
+}
+function extractProposedPlanBody(planText) {
+  const match = planText.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i);
+  return match ? match[1] : planText;
+}
+function extractStrictTodoItems(planText) {
+  const body = extractProposedPlanBody(planText).replace(/\r\n/g, "\n");
+  const lines = body.split("\n");
+  const items = [];
+  for (const rawLine of lines) {
+    if (!rawLine.trim()) {
+      continue;
+    }
+    if (rawLine !== rawLine.trimStart()) {
+      continue;
+    }
+    const match = rawLine.match(/^[-*]\s+\[(?: |x|X|-)\]\s+(.+)$/);
+    if (!match) {
+      continue;
+    }
+    const title = match[1].trim().replace(/\s+/g, " ");
+    if (title) {
+      items.push(title);
+    }
+  }
+  return Array.from(new Set(items));
+}
+function parsePlanTodoItems(planText) {
+  const items = extractStrictTodoItems(planText);
+  if (items.length === 0) {
+    return {
+      items: [],
+      error: "invalid_todo_format",
+      detail: 'No top-level markdown todo items found. Use "- [ ] <task>" lines.'
+    };
+  }
+  if (items.length < MIN_TOP_LEVEL_TASKS) {
+    return {
+      items,
+      error: "too_few_tasks",
+      detail: `Expected at least ${MIN_TOP_LEVEL_TASKS} top-level tasks, got ${items.length}.`
+    };
+  }
+  if (items.length > MAX_TOP_LEVEL_TASKS) {
+    return {
+      items,
+      error: "too_many_tasks",
+      detail: `Expected at most ${MAX_TOP_LEVEL_TASKS} top-level tasks, got ${items.length}.`
+    };
+  }
+  return { items };
+}
+function statusToCheckbox(status) {
+  if (status === "done") {
+    return "[x]";
+  }
+  if (status === "doing") {
+    return "[-]";
+  }
+  return "[ ]";
+}
+function checkboxToStatus(checkbox, blockedReason) {
+  if (checkbox === "[x]") {
+    return "done";
+  }
+  if (checkbox === "[-]") {
+    return "doing";
+  }
+  return blockedReason ? "blocked" : "todo";
+}
+function renderPlanMarkdown(meta, items) {
+  const lines = [];
+  lines.push(`# Task Plan: ${meta.planId}`);
+  lines.push("");
+  lines.push(META_START);
+  lines.push(JSON.stringify(meta, null, 2));
+  lines.push(META_END);
+  lines.push("");
+  lines.push("## Meta");
+  lines.push(`- plan_id: ${meta.planId}`);
+  lines.push(`- session_id: ${meta.sessionId}`);
+  lines.push(`- phase: ${meta.phase}`);
+  lines.push(`- plan_version: ${meta.planVersion ?? 1}`);
+  if (meta.lastReplanReason) {
+    lines.push(`- last_replan_reason: ${meta.lastReplanReason}`);
+  }
+  if (meta.orchestratorStep) {
+    lines.push(`- orchestrator_step: ${meta.orchestratorStep}`);
+  }
+  lines.push(`- created_at: ${meta.createdAt}`);
+  lines.push(`- updated_at: ${meta.updatedAt}`);
+  lines.push("");
+  lines.push("## Steps");
+  for (const item of items) {
+    lines.push(`- ${statusToCheckbox(item.status)} ${item.id} ${item.title}`);
+    if (item.notes) {
+      lines.push(`  - note: ${item.notes}`);
+    }
+    if (item.blockedReason) {
+      lines.push(`  - blocked: ${item.blockedReason}`);
+    }
+    if (item.startedAt) {
+      lines.push(`  - started_at: ${item.startedAt}`);
+    }
+    if (item.completedAt) {
+      lines.push(`  - completed_at: ${item.completedAt}`);
+    }
+  }
+  lines.push("");
+  lines.push("## Execution Log");
+  lines.push("- initialized");
+  lines.push("");
+  return `${lines.join("\n")}`;
+}
+function parseMetaBlock(markdown) {
+  const start = markdown.indexOf(META_START);
+  const end = markdown.indexOf(META_END);
+  if (start < 0 || end < 0 || end <= start) {
+    return null;
+  }
+  const body = markdown.slice(start + META_START.length, end).trim();
+  if (!body) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed.planId !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function parseItems(markdown) {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const items = [];
+  let current = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const stepMatch = line.match(/^\s*[-*]\s*(\[[ xX\-]\])\s+(task_\d+)\s+(.+)$/);
+    if (stepMatch) {
+      const checkbox = stepMatch[1].toLowerCase() === "[x]" ? "[x]" : stepMatch[1] === "[-]" ? "[-]" : "[ ]";
+      const item = {
+        id: stepMatch[2],
+        title: stepMatch[3].trim(),
+        status: checkboxToStatus(checkbox),
+        updatedAt: nowIso2()
+      };
+      items.push(item);
+      current = item;
+      continue;
+    }
+    if (!current) {
+      continue;
+    }
+    const noteMatch = line.match(/^\s*[-*]\s+note:\s*(.+)$/i);
+    if (noteMatch) {
+      current.notes = noteMatch[1].trim();
+      continue;
+    }
+    const blockedMatch = line.match(/^\s*[-*]\s+blocked:\s*(.+)$/i);
+    if (blockedMatch) {
+      current.blockedReason = blockedMatch[1].trim();
+      current.status = "blocked";
+      continue;
+    }
+    const startedMatch = line.match(/^\s*[-*]\s+started_at:\s*(.+)$/i);
+    if (startedMatch) {
+      current.startedAt = startedMatch[1].trim();
+      continue;
+    }
+    const completedMatch = line.match(/^\s*[-*]\s+completed_at:\s*(.+)$/i);
+    if (completedMatch) {
+      current.completedAt = completedMatch[1].trim();
+      continue;
+    }
+  }
+  return items;
+}
+function parsePlanMarkdown(planId) {
+  const filePath = planMarkdownPath(planId);
+  if (!fs7.existsSync(filePath)) {
+    return null;
+  }
+  const body = fs7.readFileSync(filePath, "utf8");
+  const meta = parseMetaBlock(body);
+  if (!meta) {
+    return null;
+  }
+  const items = parseItems(body);
+  const bodyLines = body.replace(/\r\n/g, "\n").split("\n");
+  return {
+    meta,
+    items,
+    bodyLines
+  };
+}
+function writePlanMarkdown(planId, meta, items, logLine) {
+  const filePath = planMarkdownPath(planId);
+  const existing = fs7.existsSync(filePath) ? fs7.readFileSync(filePath, "utf8") : "";
+  const next = renderPlanMarkdown(meta, items);
+  const logSegment = existing.includes("## Execution Log") ? existing.slice(existing.indexOf("## Execution Log")).split("\n").slice(1).filter((line) => line.trim().length > 0) : [];
+  if (logLine) {
+    logSegment.push(`- ${logLine}`);
+  }
+  const merged = `${next.replace(/\n\s*## Execution Log\n- initialized\n?\s*$/m, "")}
+## Execution Log
+${logSegment.length > 0 ? logSegment.join("\n") : "- initialized"}
+`;
+  if (existing) {
+    const snapDir = path7.join(SNAPSHOT_DIR, planId);
+    fs7.mkdirSync(snapDir, { recursive: true });
+    const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[\:\.]/g, "-");
+    fs7.writeFileSync(path7.join(snapDir, `${stamp}.md`), existing, "utf8");
+    const snapshots = fs7.readdirSync(snapDir).filter((name) => name.endsWith(".md")).sort();
+    if (snapshots.length > 20) {
+      for (const old of snapshots.slice(0, snapshots.length - 20)) {
+        fs7.unlinkSync(path7.join(snapDir, old));
+      }
+    }
+  }
+  fs7.writeFileSync(filePath, merged, "utf8");
+}
+function toSnapshot(meta, items) {
+  const normalizedItems = items.map((item) => ({
+    ...item,
+    status: item.blockedReason ? item.status === "done" ? "done" : "blocked" : item.status
+  }));
+  const stats = computeStats(normalizedItems);
+  const progress = computeProgress(normalizedItems);
+  const phase = meta.phase !== "completed" && progress.total > 0 && progress.done === progress.total && stats.blocked === 0 ? "completed" : meta.phase;
+  const currentTaskId = meta.currentTaskId ?? findCurrentTaskId(normalizedItems);
+  return {
+    planId: meta.planId,
+    sessionId: meta.sessionId,
+    phase,
+    planVersion: Math.max(1, meta.planVersion ?? 1),
+    lastReplanReason: meta.lastReplanReason,
+    orchestratorStep: meta.orchestratorStep,
+    items: normalizedItems,
+    progress,
+    currentTaskId,
+    lastUpdatedTaskId: meta.lastUpdatedTaskId,
+    blockedCount: stats.blocked,
+    stats,
+    createdAt: meta.createdAt,
+    updatedAt: meta.updatedAt
+  };
+}
+function migrateLegacyJsonIfNeeded(planId) {
+  const markdownFile = planMarkdownPath(planId);
+  if (fs7.existsSync(markdownFile)) {
+    return false;
+  }
+  const legacyPath = taskSnapshotPath(planId);
+  if (!fs7.existsSync(legacyPath)) {
+    return false;
+  }
+  try {
+    const legacy = JSON.parse(fs7.readFileSync(legacyPath, "utf8"));
+    if (!legacy || !Array.isArray(legacy.items) || typeof legacy.sessionId !== "string") {
+      return false;
+    }
+    ensureStorageDirs();
+    const meta = {
+      planId,
+      sessionId: legacy.sessionId,
+      phase: legacy.phase ?? "planning",
+      planVersion: legacy.planVersion ?? 1,
+      lastReplanReason: legacy.lastReplanReason,
+      orchestratorStep: legacy.orchestratorStep,
+      createdAt: legacy.createdAt ?? nowIso2(),
+      updatedAt: legacy.updatedAt ?? nowIso2(),
+      currentTaskId: legacy.currentTaskId,
+      lastUpdatedTaskId: legacy.lastUpdatedTaskId
+    };
+    writePlanMarkdown(planId, meta, legacy.items, "migrated_from_json");
+    appendTaskEvent(planId, {
+      eventType: "migrated_from_json",
+      planId,
+      ts: nowIso2(),
+      source: "migration"
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function createPlanArtifactsDetailed(args) {
+  const parsed = parsePlanTodoItems(args.planText);
+  if (parsed.error) {
+    return {
+      ok: false,
+      error: parsed.error,
+      detail: parsed.detail ?? parsed.error
+    };
+  }
+  const steps = parsed.items;
+  ensureStorageDirs();
+  const createdAt = nowIso2();
+  const planId = args.planId ?? randomId2();
+  const meta = {
+    planId,
+    sessionId: args.sessionId,
+    phase: "planning",
+    planVersion: 1,
+    orchestratorStep: "planning",
+    createdAt,
+    updatedAt: createdAt,
+    sourcePrompt: args.sourcePrompt
+  };
+  const items = steps.map((title, index) => ({
+    id: `task_${index + 1}`,
+    title,
+    status: "todo",
+    updatedAt: createdAt
+  }));
+  writeJson(planMetaPath(planId), {
+    ...meta,
+    sourcePrompt: args.sourcePrompt
+  });
+  writePlanMarkdown(planId, meta, items, "plan_created");
+  appendTaskEvent(planId, {
+    eventType: "plan_created",
+    planId,
+    ts: createdAt,
+    source: "mode_plan"
+  });
+  const snapshot = toSnapshot(meta, items);
+  writeJson(taskSnapshotPath(planId), snapshot);
+  return {
+    ok: true,
+    value: {
+      planId,
+      snapshot
+    }
+  };
+}
+function loadTaskSnapshot(planId) {
+  ensureStorageDirs();
+  migrateLegacyJsonIfNeeded(planId);
+  const parsed = parsePlanMarkdown(planId);
+  if (!parsed) {
+    return null;
+  }
+  const snapshot = toSnapshot(parsed.meta, parsed.items);
+  writeJson(taskSnapshotPath(planId), snapshot);
+  return snapshot;
+}
+function saveTaskSnapshot(snapshot) {
+  ensureStorageDirs();
+  const meta = {
+    planId: snapshot.planId,
+    sessionId: snapshot.sessionId,
+    phase: snapshot.phase,
+    planVersion: snapshot.planVersion,
+    lastReplanReason: snapshot.lastReplanReason,
+    orchestratorStep: snapshot.orchestratorStep,
+    createdAt: snapshot.createdAt,
+    updatedAt: nowIso2(),
+    currentTaskId: snapshot.currentTaskId,
+    lastUpdatedTaskId: snapshot.lastUpdatedTaskId
+  };
+  const items = snapshot.items.map((item) => ({ ...item, updatedAt: item.updatedAt || meta.updatedAt }));
+  writePlanMarkdown(snapshot.planId, meta, items, "snapshot_saved");
+  const next = toSnapshot(meta, items);
+  writeJson(taskSnapshotPath(snapshot.planId), next);
+  return next;
+}
+function startNextTodoTask(planId, items, source) {
+  const nextItems = items.map((item) => ({ ...item }));
+  const nextTodo = nextItems.find((item) => item.status === "todo");
+  if (!nextTodo) {
+    return {
+      items: nextItems,
+      currentTaskId: void 0
+    };
+  }
+  const ts = nowIso2();
+  nextTodo.status = "doing";
+  nextTodo.updatedAt = ts;
+  nextTodo.startedAt = nextTodo.startedAt ?? ts;
+  nextTodo.attempts = (nextTodo.attempts ?? 0) + 1;
+  appendTaskEvent(planId, {
+    eventType: "task_started",
+    planId,
+    taskId: nextTodo.id,
+    from: "todo",
+    to: "doing",
+    ts,
+    source
+  });
+  return {
+    items: nextItems,
+    currentTaskId: nextTodo.id
+  };
+}
+function updateCurrentTaskOutcome(planId, outcome, options) {
+  const snapshot = loadTaskSnapshot(planId);
+  if (!snapshot || snapshot.phase !== "solving") {
+    return snapshot;
+  }
+  const source = options?.source ?? "runtime";
+  const note = options?.note?.trim() ?? "";
+  const ts = nowIso2();
+  const items = snapshot.items.map((item) => ({ ...item }));
+  const current = items.find((item) => item.status === "doing");
+  if (!current) {
+    return snapshot;
+  }
+  if (outcome === "doing") {
+    if (!note) {
+      return snapshot;
+    }
+    current.notes = note;
+    current.updatedAt = ts;
+    appendTaskEvent(planId, {
+      eventType: "task_note_updated",
+      planId,
+      taskId: current.id,
+      ts,
+      source,
+      note
+    });
+    return saveTaskSnapshot({
+      ...snapshot,
+      items,
+      currentTaskId: current.id,
+      lastUpdatedTaskId: current.id
+    });
+  }
+  if (outcome === "blocked") {
+    current.status = "blocked";
+    current.blockedReason = note || current.blockedReason;
+    current.notes = note || current.notes;
+    current.updatedAt = ts;
+    appendTaskEvent(planId, {
+      eventType: "task_blocked",
+      planId,
+      taskId: current.id,
+      from: "doing",
+      to: "blocked",
+      ts,
+      source,
+      note
+    });
+    return saveTaskSnapshot({
+      ...snapshot,
+      items,
+      currentTaskId: void 0,
+      lastUpdatedTaskId: current.id
+    });
+  }
+  current.status = "done";
+  current.completedAt = ts;
+  current.updatedAt = ts;
+  if (note) {
+    current.notes = note;
+  }
+  appendTaskEvent(planId, {
+    eventType: "task_completed",
+    planId,
+    taskId: current.id,
+    from: "doing",
+    to: "done",
+    ts,
+    source,
+    note
+  });
+  const withNext = startNextTodoTask(planId, items, source);
+  return saveTaskSnapshot({
+    ...snapshot,
+    items: withNext.items,
+    currentTaskId: withNext.currentTaskId,
+    lastUpdatedTaskId: current.id
+  });
+}
+function ensureSolvingTaskConsistency(planId, source = "self_heal") {
+  const snapshot = loadTaskSnapshot(planId);
+  if (!snapshot || snapshot.phase !== "solving") {
+    return snapshot;
+  }
+  const doingCount = snapshot.items.filter((item) => item.status === "doing").length;
+  if (doingCount > 0) {
+    return snapshot;
+  }
+  const hasTodo = snapshot.items.some((item) => item.status === "todo");
+  if (!hasTodo) {
+    return saveTaskSnapshot(snapshot);
+  }
+  const withNext = startNextTodoTask(planId, snapshot.items, source);
+  return saveTaskSnapshot({
+    ...snapshot,
+    items: withNext.items,
+    currentTaskId: withNext.currentTaskId
+  });
+}
+function parseTaskOutcomeFromAssistantReply(reply) {
+  const normalized = reply.replace(/\r\n/g, "\n");
+  const stateMatch = normalized.match(/^TASK_STATE:\s*(done|blocked|doing)\s*$/gim);
+  if (!stateMatch || stateMatch.length === 0) {
+    return null;
+  }
+  const lastStateLine = stateMatch[stateMatch.length - 1] ?? "";
+  const outcomeMatch = lastStateLine.match(/(done|blocked|doing)/i);
+  if (!outcomeMatch) {
+    return null;
+  }
+  const noteMatch = normalized.match(/^TASK_NOTE:\s*(.*)$/gim);
+  const note = noteMatch && noteMatch.length > 0 ? noteMatch[noteMatch.length - 1]?.replace(/^TASK_NOTE:\s*/i, "").trim() : "";
+  return {
+    outcome: outcomeMatch[1].toLowerCase(),
+    note: note || void 0
+  };
+}
+
+// src/agents/task_agent.ts
+async function runTaskAgent(agent, snapshot, mode, context, options) {
+  const result = await runIsolatedAgentTurn(
+    agent,
+    {
+      role: "tasker",
+      name: "tasker",
+      mode,
+      prompt: buildTaskAgentPrompt(snapshot)
+    },
+    context,
+    options
+  );
+  const parsed = parseTaskOutcomeFromAssistantReply(result.output);
+  const meta = parsed ? { taskStateDelta: parsed } : { parseError: "missing_task_state_control_line" };
+  return asNamedResult(result, "tasker", "tasker", meta);
+}
+
+// src/agents/reviewer_agent.ts
+var REVIEWER_PROMPT = "Review the proposed approach and list potential issues.";
+async function runReviewerAgent(agent, context, basePrompt, options) {
+  const prompt = basePrompt ? `${basePrompt}
+
+${REVIEWER_PROMPT}` : REVIEWER_PROMPT;
+  const result = await runIsolatedAgentTurn(
+    agent,
+    {
+      role: "reviewer",
+      name: "reviewer",
+      mode: "plan",
+      prompt
+    },
+    context,
+    options
+  );
+  return asNamedResult(result, "reviewer", "reviewer", {});
+}
+
+// src/agents/coder_agent.ts
+var CODER_PROMPT = "Provide concrete code-level changes to implement the request.";
+async function runCoderAgent(agent, context, basePrompt, options) {
+  const prompt = basePrompt ? `${basePrompt}
+
+${CODER_PROMPT}` : CODER_PROMPT;
+  const result = await runIsolatedAgentTurn(
+    agent,
+    {
+      role: "coder",
+      name: "coder",
+      mode: "edit",
+      prompt
+    },
+    context,
+    options
+  );
+  return asNamedResult(result, "coder", "coder", {});
+}
+
+// src/agents/orchestrator.ts
+async function runTriadReview(agent, basePrompt, context, options) {
+  const planner = await runPlanAgent(agent, basePrompt, context, options);
+  const coder = await runCoderAgent(agent, context, basePrompt, {
+    ...options,
+    onDelta: void 0,
+    onToolEvent: void 0,
+    onUserQuestion: options?.onUserQuestion
+  });
+  const reviewer = await runReviewerAgent(agent, context, basePrompt, {
+    ...options,
+    onDelta: void 0,
+    onToolEvent: void 0,
+    onUserQuestion: options?.onUserQuestion
+  });
+  return [planner, coder, reviewer];
+}
+
+// src/config.ts
+import fs8 from "fs";
+import os7 from "os";
+import path8 from "path";
 var DEFAULT_MAX_TURNS = 24;
 var MIN_MAX_TURNS = 1;
 var MAX_MAX_TURNS = 200;
@@ -1751,20 +2537,21 @@ function parseMaxTurns(value) {
   }
   return Math.max(MIN_MAX_TURNS, Math.min(MAX_MAX_TURNS, Math.trunc(parsed)));
 }
-var CONFIG_DIR = path7.join(os6.homedir(), ".happycode");
-var CONFIG_PATH = path7.join(CONFIG_DIR, "config.json");
+var CONFIG_DIR = path8.join(os7.homedir(), ".happycode");
+var CONFIG_PATH = path8.join(CONFIG_DIR, "config.json");
 function getConfigPath() {
   return CONFIG_PATH;
 }
 function ensureConfigDir() {
-  fs7.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs8.mkdirSync(CONFIG_DIR, { recursive: true });
 }
 function readConfig() {
-  if (!fs7.existsSync(CONFIG_PATH)) {
+  if (!fs8.existsSync(CONFIG_PATH)) {
     return null;
   }
-  const raw = fs7.readFileSync(CONFIG_PATH, "utf8");
-  const parsed = JSON.parse(raw);
+  const raw = fs8.readFileSync(CONFIG_PATH, "utf8");
+  const normalized = raw.charCodeAt(0) === 65279 ? raw.slice(1) : raw;
+  const parsed = JSON.parse(normalized);
   if (!parsed.baseUrl || !parsed.apiKey) {
     return null;
   }
@@ -1777,7 +2564,7 @@ function readConfig() {
 }
 function writeConfig(config) {
   ensureConfigDir();
-  fs7.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
+  fs8.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}
 `, "utf8");
 }
 
@@ -1786,7 +2573,6 @@ export {
   getProjectMemoryPath,
   ensureMemoryFile,
   openMemoryFile,
-  buildRuntimeMemoryPrompt,
   getModePolicy,
   getModePrompt,
   SUPPORTED_MODES,
@@ -1817,6 +2603,7 @@ export {
   appendInputHistoryEntry,
   bindPlanToActiveSession,
   setActiveSessionPlanPhase,
+  setActiveSessionPlanRuntimeState,
   clearActiveSessionPlanBinding,
   renameActiveSession,
   forkActiveSession,
@@ -1827,6 +2614,19 @@ export {
   listSessionApprovals,
   clearSessionApprovals,
   HappyCodeAgent,
+  runIsolatedAgentTurn,
+  parseReplanDecision,
+  runPlanAgent,
+  MAX_TOP_LEVEL_TASKS,
+  createPlanArtifactsDetailed,
+  loadTaskSnapshot,
+  updateCurrentTaskOutcome,
+  ensureSolvingTaskConsistency,
+  parseTaskOutcomeFromAssistantReply,
+  runTaskAgent,
+  runReviewerAgent,
+  runCoderAgent,
+  runTriadReview,
   getConfigPath,
   readConfig,
   writeConfig

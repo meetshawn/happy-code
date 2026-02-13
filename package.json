@@ -15,6 +15,8 @@
     "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean",
     "dev": "tsx src/cli.ts",
     "check": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "test:agents": "tsx --test test/agents/**/*.test.ts",
     "prepublish:check": "npm run check && npm run build && npm pack --dry-run",
     "prepublishOnly": "npm run prepublish:check"
   },

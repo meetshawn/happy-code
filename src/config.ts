@@ -45,7 +45,8 @@ export function readConfig(): HappyCodeConfig | null {
   }
 
   const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
-  const parsed = JSON.parse(raw) as Partial<HappyCodeConfig>;
+  const normalized = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const parsed = JSON.parse(normalized) as Partial<HappyCodeConfig>;
   if (!parsed.baseUrl || !parsed.apiKey) {
     return null;
   }

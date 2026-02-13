@@ -24,6 +24,7 @@ import type { McpClientManager } from './mcp_client.js';
 import { type AgentMode } from './modes.js';
 import { getGlobalPolicyPath, getPolicyPath, writeDefaultGlobalPolicy, writeDefaultPolicy } from './policy.js';
 import {
+  setActiveSessionPlanRuntimeState,
   appendInputHistoryEntry,
   approveCommandForSession,
   approveCommandOnce,
@@ -45,17 +46,16 @@ import {
   saveSessionToolEvents,
   switchSession
 } from './session.js';
+import { runTriadReview } from './agents/index.js';
 import { MultiAgentRuntime } from './agents_runtime.js';
 import {
-  createPlanArtifacts,
-  enterSolvingPhase,
+  createPlanArtifactsDetailed,
   ensureSolvingTaskConsistency,
-  formatTaskProgressLine,
-  formatTaskSummary,
-  formatTaskTodos,
   loadTaskSnapshot,
+  MAX_TOP_LEVEL_TASKS,
   parseTaskOutcomeFromAssistantReply,
-  updateCurrentTaskOutcome
+  updateCurrentTaskOutcome,
+  type TaskStateSnapshot
 } from './plan_mode_state.js';
 import { capturePreTurnSnapshot, rollbackCode, type PreTurnSnapshot, type RollbackMode } from './rollback.js';
 
@@ -167,8 +167,6 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/new', complete: '/new', desc: 'Start new conversation' },
   { cmd: '/compact', complete: '/compact', desc: 'Compact context' },
   { cmd: '/review', complete: '/review', desc: 'Review current git diff' },
-  { cmd: '/plan', complete: '/plan', desc: 'Generate implementation plan' },
-  { cmd: '/solve', complete: '/solve', desc: 'Enter solve phase for active plan' },
   { cmd: '/test [command]', complete: '/test', desc: 'Run tests via tools' },
   { cmd: '/fix', complete: '/fix', desc: 'Investigate and fix issues' },
   { cmd: '/theme', complete: '/theme ', desc: 'Get or set UI theme' },
@@ -184,8 +182,6 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/context', complete: '/context', desc: 'Show context summary' },
   { cmd: '/stats', complete: '/stats', desc: 'Show local usage stats from audit log' },
   { cmd: '/usage', complete: '/usage', desc: 'Alias for /stats' },
-  { cmd: '/tasks', complete: '/tasks', desc: 'Summarize pending tasks' },
-  { cmd: '/todos', complete: '/todos', desc: 'Generate TODO checklist' },
   { cmd: '/copy', complete: '/copy', desc: 'Copy latest assistant response' },
   { cmd: '/debug', complete: '/debug', desc: 'Show debug info' },
   { cmd: '/doctor', complete: '/doctor', desc: 'Run environment checks' },
@@ -209,6 +205,50 @@ const COMMANDS: CommandDef[] = [
   { cmd: '/clear', complete: '/clear', desc: 'Clear conversation' },
   { cmd: '/exit', complete: '/exit', desc: 'Quit' }
 ];
+
+const CORE_COMMANDS_SET = new Set([
+  '/help',
+  '/new',
+  '/test [command]',
+  '/fix',
+  '/model [name]',
+  '/resume',
+  '/clear',
+  '/exit'
+]);
+
+const CORE_COMMANDS: CommandDef[] = COMMANDS.filter((item) => CORE_COMMANDS_SET.has(item.cmd));
+
+const MODE_HELP_TEXT = [
+  'Modes:',
+  '  plan  Analysis and implementation planning',
+  '  edit  Direct coding and code changes',
+  '  auto  Adaptive mode selection',
+  'Shortcut: Shift+Tab to cycle modes'
+].join('\n');
+
+function renderCommandHelp(commands: CommandDef[]): string {
+  return commands.map((item) => `${item.cmd.padEnd(34, ' ')} ${item.desc}`).join('\n');
+}
+
+function buildHelpText(scope: 'core' | 'all'): string {
+  const title = scope === 'all' ? 'All Commands:' : 'Core Commands:';
+  const hint = scope === 'all' ? 'Tip: use /help <command> for details.' : 'Tip: use /help all to see advanced commands.';
+  const source = scope === 'all' ? COMMANDS : CORE_COMMANDS;
+  return [title, renderCommandHelp(source), '', hint, '', MODE_HELP_TEXT].join('\n');
+}
+
+function findCommandForHelp(query: string): CommandDef | undefined {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  const exact = COMMANDS.find((item) => item.cmd.toLowerCase() === normalized || item.complete.trim().toLowerCase() === normalized);
+  if (exact) {
+    return exact;
+  }
+  return COMMANDS.find((item) => item.cmd.toLowerCase().startsWith(normalized));
+}
 
 type ModeDisplay = {
   label: string;
@@ -234,20 +274,12 @@ const MODE_DISPLAY: Record<AgentMode, ModeDisplay> = {
   }
 };
 
-const HELP_TEXT = [
-  COMMANDS.map((item) => `${item.cmd.padEnd(34, ' ')} ${item.desc}`).join('\n'),
-  '',
-  'Modes:',
-  '  plan  Analysis and implementation planning',
-  '  edit  Direct coding and code changes',
-  '  auto  Adaptive mode selection',
-  'Shortcut: Shift+Tab to cycle modes'
-].join('\n');
 const MODE_CYCLE: AgentMode[] = ['plan', 'edit', 'auto'];
 const MAX_RENDER_FLOW_ITEMS = 120;
 const MAX_TOOL_EVENTS_STORE = 2000;
 const MAX_PREVIEW_LINES = 5;
 const MAX_PREVIEW_CHARS = 560;
+const PLAN_PANEL_MAX_ITEMS = 8;
 
 function pad2(value: number): string {
   return String(value).padStart(2, '0');
@@ -380,7 +412,7 @@ function getCommandParamHint(command: CommandDef): string {
 }
 
 function getInlineParamPlaceholder(input: string): string {
-  const matched = COMMANDS.find((item) => item.complete.endsWith(' ') && input === item.complete);
+  const matched = CORE_COMMANDS.find((item) => item.complete.endsWith(' ') && input === item.complete);
   if (!matched) {
     return '';
   }
@@ -423,6 +455,14 @@ function parseMentionFiles(input: string, cwd: string): string[] {
     }
   }
   return files;
+}
+
+function isSubAgentLogMessage(message: ChatMessage): boolean {
+  return message.role === 'assistant' && /^\[subagent:/i.test(message.content.trim());
+}
+
+function stripSubAgentMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.filter((item) => !isSubAgentLogMessage(item));
 }
 
 export function App({
@@ -469,7 +509,7 @@ export function App({
   const [selectedOptionIndex, setSelectedOptionIndex] = useState(0);
   const [memoryPickerOpen, setMemoryPickerOpen] = useState(false);
   const [memoryPickerCursor, setMemoryPickerCursor] = useState(0);
-  const [taskProgressLine, setTaskProgressLine] = useState('');
+  const [taskSnapshot, setTaskSnapshot] = useState<TaskStateSnapshot | null>(null);
   const [rollbackArmedUntil, setRollbackArmedUntil] = useState<number | null>(null);
   const [inputHistory, setInputHistory] = useState<InputHistoryEntry[]>([]);
   const [historyBrowseActive, setHistoryBrowseActive] = useState(false);
@@ -585,6 +625,9 @@ export function App({
       meta: pendingUserQuestion.meta ?? {}
     };
 
+    const questionKind =
+      typeof pendingUserQuestion.meta?.kind === 'string' ? pendingUserQuestion.meta.kind : undefined;
+
     if (pendingUserQuestion.title === 'Shell approval required') {
       const meta = (pendingUserQuestion.meta ?? {}) as Record<string, unknown>;
       const command = typeof meta.command === 'string' ? meta.command : '';
@@ -609,7 +652,7 @@ export function App({
     pendingQuestionResolveRef.current = null;
     closeUserQuestion();
 
-    if (pendingUserQuestion.title === 'Rollback code as well?') {
+    if (questionKind === 'rollback_confirm' || pendingUserQuestion.title === 'Rollback code as well?') {
       const optionId = answer.optionId;
       const mode: RollbackMode =
         optionId === 'rollback_both' ? 'both' : optionId === 'rollback_dialogue' ? 'dialogue_only' : 'keep';
@@ -722,23 +765,23 @@ export function App({
     []
   );
 
-  const refreshTaskProgressLine = useCallback(() => {
+  const refreshTaskSnapshot = useCallback(() => {
     const active = loadActiveSession(process.cwd());
     if (!active.activePlanId) {
-      setTaskProgressLine('');
+      setTaskSnapshot(null);
       return;
     }
     const snapshot = loadTaskSnapshot(active.activePlanId);
     if (!snapshot) {
-      setTaskProgressLine('');
+      setTaskSnapshot(null);
       return;
     }
-    setTaskProgressLine(formatTaskProgressLine(snapshot));
+    setTaskSnapshot(snapshot);
   }, []);
 
   useEffect(() => {
-    refreshTaskProgressLine();
-  }, [history, refreshTaskProgressLine]);
+    refreshTaskSnapshot();
+  }, [history, refreshTaskSnapshot]);
 
   useEffect(() => {
     setInputHistory(getInputHistory(process.cwd()));
@@ -811,7 +854,12 @@ export function App({
     }
 
     const needle = trimmed.toLowerCase();
-    return COMMANDS.filter((item) => item.cmd.toLowerCase().startsWith(needle))
+    const coreMatches = CORE_COMMANDS.filter((item) => item.cmd.toLowerCase().startsWith(needle));
+    const advancedMatches = COMMANDS.filter(
+      (item) => !CORE_COMMANDS_SET.has(item.cmd) && item.cmd.toLowerCase().startsWith(needle)
+    );
+    const commandsToShow = coreMatches.length > 0 || needle === '/' ? coreMatches : [...coreMatches, ...advancedMatches];
+    return commandsToShow
       .map((item) => ({
         label: item.cmd,
         insert: item.complete,
@@ -1069,7 +1117,11 @@ export function App({
   });
 
   const runAgentTask = useCallback(
-      async (taskPrompt: string, modeOverride?: AgentMode, historyEntryIdOverride?: string): Promise<void> => {
+      async (
+        taskPrompt: string,
+        modeOverride?: AgentMode,
+        historyEntryIdOverride?: string
+      ): Promise<string | null> => {
         const historyEntryId = historyEntryIdOverride ?? inputHistory[inputHistory.length - 1]?.id ?? '';
         preTurnSnapshotRef.current = capturePreTurnSnapshot({
           historyEntryId,
@@ -1101,7 +1153,7 @@ export function App({
       }
 
       const userMessage: ChatMessage = { role: 'user', content: enhancedPrompt };
-      const nextHistory: ChatMessage[] = [...history, userMessage];
+      const nextHistory: ChatMessage[] = [...stripSubAgentMessages(history), userMessage];
       setHistory(nextHistory);
       onHistoryChange?.(nextHistory);
 
@@ -1206,46 +1258,7 @@ export function App({
           }
           );
 
-          let finalReply = reply;
-          if (effectiveMode === 'plan') {
-            const active = loadActiveSession(process.cwd());
-            const persisted = createPlanArtifacts({
-              sessionId: active.id,
-              planText: reply,
-              sourcePrompt: taskPrompt
-            });
-            if (persisted) {
-              bindPlanToActiveSession(persisted.planId, persisted.planId, 'planning', process.cwd());
-              finalReply = `${reply}\n\n---\nplan_state: saved\nplan_id: ${persisted.planId}\nphase: planning\ntasks: ${persisted.snapshot.stats.total}`;
-              setTaskProgressLine(formatTaskProgressLine(persisted.snapshot));
-            }
-          } else {
-            const active = loadActiveSession(process.cwd());
-            if (active.activePlanId && active.planSolvePhase === 'solving') {
-              const parsed = parseTaskOutcomeFromAssistantReply(reply);
-              if (parsed) {
-                const updated = updateCurrentTaskOutcome(active.activePlanId, parsed.outcome, {
-                  note: parsed.note,
-                  source: 'assistant_reply'
-                });
-                if (updated) {
-                  finalReply = `${reply}\n\n---\n${formatTaskProgressLine(updated)}`;
-                  if (updated.phase === 'completed') {
-                    setActiveSessionPlanPhase('completed', process.cwd());
-                  }
-                  setTaskProgressLine(formatTaskProgressLine(updated));
-                }
-              } else {
-                const healed = ensureSolvingTaskConsistency(active.activePlanId, 'turn_consistency');
-                if (healed) {
-                  if (healed.phase === 'completed') {
-                    setActiveSessionPlanPhase('completed', process.cwd());
-                  }
-                  setTaskProgressLine(formatTaskProgressLine(healed));
-                }
-              }
-            }
-          }
+          const finalReply = reply;
 
           setHistory((prev) => {
             const assistantMessage: ChatMessage = { role: 'assistant', content: finalReply };
@@ -1253,6 +1266,72 @@ export function App({
             onHistoryChange?.(updated);
             return updated;
         });
+
+        if (effectiveMode === 'plan') {
+          const active = loadActiveSession(process.cwd());
+          const persisted = createPlanArtifactsDetailed({
+            sessionId: active.id,
+            planText: finalReply,
+            sourcePrompt: taskPrompt
+          });
+          if (persisted.ok) {
+            bindPlanToActiveSession(persisted.value.planId, persisted.value.planId, 'planning', process.cwd());
+            setActiveSessionPlanRuntimeState(
+              {
+                planVersion: persisted.value.snapshot.planVersion,
+                orchestratorStep: 'planning'
+              },
+              process.cwd()
+            );
+            setTaskSnapshot(persisted.value.snapshot);
+          } else {
+            pushAssistant(
+              `Plan was not persisted: ${persisted.detail} Top-level markdown todos must be 3-${MAX_TOP_LEVEL_TASKS}.`,
+              setHistory,
+              onHistoryChange
+            );
+          }
+        } else {
+          const active = loadActiveSession(process.cwd());
+          if (active.activePlanId && active.planSolvePhase === 'solving') {
+            const parsed = parseTaskOutcomeFromAssistantReply(finalReply);
+            if (parsed) {
+              const updated = updateCurrentTaskOutcome(active.activePlanId, parsed.outcome, {
+                note: parsed.note,
+                source: 'assistant_reply'
+              });
+              if (updated) {
+                if (updated.phase === 'completed') {
+                  setActiveSessionPlanPhase('completed', process.cwd());
+                }
+                setActiveSessionPlanRuntimeState(
+                  {
+                    planVersion: updated.planVersion,
+                    orchestratorStep: updated.orchestratorStep ?? 'tasking'
+                  },
+                  process.cwd()
+                );
+                setTaskSnapshot(updated);
+              }
+            } else {
+              const healed = ensureSolvingTaskConsistency(active.activePlanId, 'turn_consistency');
+              if (healed) {
+                if (healed.phase === 'completed') {
+                  setActiveSessionPlanPhase('completed', process.cwd());
+                }
+                setActiveSessionPlanRuntimeState(
+                  {
+                    planVersion: healed.planVersion,
+                    orchestratorStep: healed.orchestratorStep ?? 'tasking'
+                  },
+                  process.cwd()
+                );
+                setTaskSnapshot(healed);
+              }
+            }
+          }
+        }
+
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
           streamingFlushTimerRef.current = null;
@@ -1260,6 +1339,7 @@ export function App({
         setStreaming(streamingBufferRef.current);
         setStreaming('');
         streamingBufferRef.current = '';
+        return finalReply;
       } catch (err) {
         pendingQuestionResolveRef.current = null;
         closeUserQuestion();
@@ -1269,6 +1349,7 @@ export function App({
         } else {
           setError(message);
         }
+        return null;
       } finally {
         if (streamingFlushTimerRef.current) {
           clearTimeout(streamingFlushTimerRef.current);
@@ -1286,7 +1367,31 @@ export function App({
   const handleSlashCommand = useCallback(
     (content: string): boolean => {
       if (content === '/help') {
-        pushAssistant(HELP_TEXT, setHistory, onHistoryChange);
+        pushAssistant(buildHelpText('core'), setHistory, onHistoryChange);
+        return true;
+      }
+
+      if (content === '/help all') {
+        pushAssistant(buildHelpText('all'), setHistory, onHistoryChange);
+        return true;
+      }
+
+      if (content.startsWith('/help ')) {
+        const query = content.replace('/help ', '').trim();
+        const command = findCommandForHelp(query);
+        if (!command) {
+          pushAssistant(`Unknown command: ${query}\nUse /help for common commands, /help all for full list.`, setHistory, onHistoryChange);
+          return true;
+        }
+        const detail = [
+          `Command: ${command.cmd}`,
+          `Description: ${command.desc}`,
+          `Usage: ${command.cmd}`,
+          command.complete.endsWith(' ')
+            ? `Completion prefix: ${command.complete}`
+            : 'Completion prefix: (none)'
+        ].join('\n');
+        pushAssistant(detail, setHistory, onHistoryChange);
         return true;
       }
 
@@ -1305,7 +1410,11 @@ export function App({
           `active_session: ${active.id} (${active.name})`,
           `active_plan: ${active.activePlanId ?? '(none)'}`,
           `plan_phase: ${active.planSolvePhase ?? 'planning'}`,
-          `task_progress: ${taskProgressLine || '(none)'}`
+          `task_progress: ${
+            taskSnapshot
+              ? `${taskSnapshot.progress.done}/${taskSnapshot.progress.total} (${taskSnapshot.progress.percent}%)`
+              : '(none)'
+          }`
         ].join('\n');
         pushAssistant(status, setHistory, onHistoryChange);
         return true;
@@ -1393,7 +1502,7 @@ export function App({
 
       if (content === '/new') {
         clearActiveSessionPlanBinding(process.cwd());
-        setTaskProgressLine('');
+        setTaskSnapshot(null);
         preTurnSnapshotRef.current = null;
         snapshotByHistoryIdRef.current.clear();
         setHistoryBrowseActive(false);
@@ -1429,32 +1538,6 @@ export function App({
         return true;
       }
 
-      if (content === '/plan') {
-        void runAgentTask(
-          'Please produce a concrete implementation plan for the current task. Focus on ordered steps, risks, and validation strategy.',
-          'plan'
-        );
-        return true;
-      }
-
-      if (content === '/solve') {
-        const active = loadActiveSession(process.cwd());
-        const planId = active.activePlanId;
-        if (!planId) {
-          pushAssistant('No active plan is bound to this session yet.', setHistory, onHistoryChange);
-          return true;
-        }
-        const next = enterSolvingPhase(planId, 'slash_solve');
-        if (!next) {
-          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
-          return true;
-        }
-        setActiveSessionPlanPhase('solving', process.cwd());
-        setTaskProgressLine(formatTaskProgressLine(next));
-        preTurnSnapshotRef.current = null;
-        pushAssistant(formatTaskSummary(next), setHistory, onHistoryChange);
-        return true;
-      }
 
       if (content.startsWith('/test')) {
         const custom = content.replace('/test', '').trim();
@@ -1470,52 +1553,6 @@ export function App({
           'Investigate current project issues using available tools, implement a minimal fix, and explain what was changed and why.',
           'auto'
         );
-        return true;
-      }
-
-      if (content === '/tasks') {
-        const active = loadActiveSession(process.cwd());
-        const planId = active.activePlanId;
-        if (!planId) {
-          pushAssistant('No active plan state found. Use plan mode to generate a plan first.', setHistory, onHistoryChange);
-          return true;
-        }
-        const snapshot = loadTaskSnapshot(planId);
-        if (!snapshot) {
-          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
-          return true;
-        }
-        if (snapshot.phase === 'solving') {
-          const healed = ensureSolvingTaskConsistency(planId, 'slash_tasks') ?? snapshot;
-          setTaskProgressLine(formatTaskProgressLine(healed));
-          pushAssistant(formatTaskSummary(healed), setHistory, onHistoryChange);
-          return true;
-        }
-        setTaskProgressLine(formatTaskProgressLine(snapshot));
-        pushAssistant(formatTaskSummary(snapshot), setHistory, onHistoryChange);
-        return true;
-      }
-
-      if (content === '/todos') {
-        const active = loadActiveSession(process.cwd());
-        const planId = active.activePlanId;
-        if (!planId) {
-          pushAssistant('No active plan state found. Use plan mode to generate a plan first.', setHistory, onHistoryChange);
-          return true;
-        }
-        const snapshot = loadTaskSnapshot(planId);
-        if (!snapshot) {
-          pushAssistant(`Task state file missing for plan: ${planId}`, setHistory, onHistoryChange);
-          return true;
-        }
-        if (snapshot.phase === 'solving') {
-          const healed = ensureSolvingTaskConsistency(planId, 'slash_todos') ?? snapshot;
-          setTaskProgressLine(formatTaskProgressLine(healed));
-          pushAssistant(`plan_id: ${healed.planId}\nphase: ${healed.phase}\n\n${formatTaskTodos(healed)}`, setHistory, onHistoryChange);
-          return true;
-        }
-        setTaskProgressLine(formatTaskProgressLine(snapshot));
-        pushAssistant(`plan_id: ${snapshot.planId}\nphase: ${snapshot.phase}\n\n${formatTaskTodos(snapshot)}`, setHistory, onHistoryChange);
         return true;
       }
 
@@ -1554,7 +1591,7 @@ export function App({
 
       if (content === '/clear') {
         clearActiveSessionPlanBinding(process.cwd());
-        setTaskProgressLine('');
+        setTaskSnapshot(null);
         preTurnSnapshotRef.current = null;
         snapshotByHistoryIdRef.current.clear();
         setHistoryBrowseActive(false);
@@ -1627,32 +1664,37 @@ export function App({
         const base = content.replace('/agents', '').trim();
         const prompt = base || 'analyze current project and propose concrete implementation steps';
         void (async () => {
-          const runtimeAgent = new MultiAgentRuntime(agent);
-          const results = await runtimeAgent.runTasks(
-            [{ role: 'user', content: prompt }],
-            [
-              {
-                name: 'planner',
-                mode: 'plan',
-                prompt: 'Create a detailed implementation plan with risks.'
-              },
-              {
-                name: 'coder',
-                mode: 'edit',
-                prompt: 'Provide concrete code-level changes to implement the request.'
-              },
-              {
-                name: 'reviewer',
-                mode: 'plan',
-                prompt: 'Review the proposed approach and list potential issues.'
-              }
-            ],
+          const resultsRaw = await runTriadReview(
+            agent,
+            prompt,
             {
               cwd: process.cwd(),
               enableAudit,
-              maxTurns: runtime.maxTurns
-            }
+              model: runtime.model,
+              fallbackModel: runtime.fallbackModel,
+              maxTurns: runtime.maxTurns,
+              allowedTools: runtime.allowedTools,
+              disallowedTools: runtime.disallowedTools,
+              systemPrompt: runtime.systemPrompt,
+              appendSystemPrompt: runtime.appendSystemPrompt
+            },
+            mcpManager
+              ? {
+                  mcpTools: await mcpManager.listTools(),
+                  mcpCall: (fullName, args) => mcpManager.callTool(fullName, args)
+                }
+              : undefined
           );
+          const results = resultsRaw.map((item) => ({
+            name: item.name,
+            mode: item.mode,
+            output: item.output,
+            io: {
+              summary: item.summary,
+              taskStateDelta: item.meta.taskStateDelta,
+              replanDecision: item.meta.replanDecision
+            }
+          }));
           pushAssistant(MultiAgentRuntime.formatResults(results), setHistory, onHistoryChange);
         })();
         return true;
@@ -1864,7 +1906,7 @@ export function App({
       openMemoryByScope,
       rollbackHistoryPickerOpen,
       runtime,
-      taskProgressLine
+      taskSnapshot
     ]
   );
 
@@ -2107,6 +2149,27 @@ export function App({
   }, [history, toolStepsByTurn]);
 
   const modeDisplay = MODE_DISPLAY[runtime.mode] ?? MODE_DISPLAY.auto;
+  const sortedPlanItems = useMemo(() => {
+    if (!taskSnapshot) {
+      return [];
+    }
+    const order: Record<TaskStateSnapshot['items'][number]['status'], number> = {
+      doing: 0,
+      blocked: 1,
+      todo: 2,
+      done: 3
+    };
+    return [...taskSnapshot.items].sort((a, b) => {
+      const left = order[a.status] ?? 9;
+      const right = order[b.status] ?? 9;
+      if (left !== right) {
+        return left - right;
+      }
+      return a.id.localeCompare(b.id);
+    });
+  }, [taskSnapshot]);
+  const visiblePlanItems = sortedPlanItems.slice(0, PLAN_PANEL_MAX_ITEMS);
+  const hiddenPlanItems = Math.max(0, sortedPlanItems.length - visiblePlanItems.length);
 
   return (
     <Box flexDirection="column" padding={1}>
@@ -2179,6 +2242,27 @@ export function App({
         ) : null}
       </Box>
 
+      {taskSnapshot ? (
+        <Box marginTop={1} flexDirection="column" width={contentWidth}>
+          <Box>
+            <Text color="gray">* </Text>
+            <Text color="cyan">Updated Plan ({visiblePlanItems.length}/{taskSnapshot.items.length})</Text>
+          </Box>
+          {visiblePlanItems.map((item) => {
+            const marker = item.status === 'done' ? '[x]' : '[ ]';
+            const color = item.status === 'doing' ? 'cyan' : item.status === 'blocked' ? 'yellow' : 'gray';
+            const suffix = item.status === 'blocked' ? ' (blocked)' : '';
+            return (
+              <Text key={item.id} color={color}>
+                {'  '} {marker} {item.title}
+                {suffix}
+              </Text>
+            );
+          })}
+          {hiddenPlanItems > 0 ? <Text color="gray">{`  ... ${hiddenPlanItems} more tasks.`}</Text> : null}
+        </Box>
+      ) : null}
+
       {loading ? (
         <Box marginTop={1}>
           <Text color="yellow">Thinking...</Text>
@@ -2202,12 +2286,6 @@ export function App({
           <Text color={modeDisplay.color}>{modeDisplay.label}</Text>
           <Text color="gray"> - {modeDisplay.hint} (Shift+Tab to cycle)</Text>
         </Box>
-        {taskProgressLine ? (
-          <Box marginTop={1}>
-            <Text color="cyan">Task Progress: </Text>
-            <Text color="gray">{taskProgressLine}</Text>
-          </Box>
-        ) : null}
         {historyBrowseActive ? (
           <Box>
             <Text color="gray">
@@ -2294,3 +2372,4 @@ export function App({
     </Box>
   );
 }
+
